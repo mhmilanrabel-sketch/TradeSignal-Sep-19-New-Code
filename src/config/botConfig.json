@@ -1,0 +1,53 @@
+{
+  "agent_config": {
+    "bot_id": "AI_SCALPER_AGENT_01",
+    "main_agent_endpoint": "https://api.yourmainagent.com/v1/telemetry",
+    "websocket_relay": "wss://api.yourmainagent.com/v1/stream",
+    "auto_code_patching_enabled": true,
+    "self_healing_telemetry_interval_ms": 5000
+  },
+  "binance_config": {
+    "base_ws_url": "wss://stream.binance.com:9443/ws",
+    "base_futures_ws_url": "wss://fstream.binance.com/ws/",
+    "symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT", "ADAUSDT"],
+    "execution_mode": "FUTURES",
+    "leverage": 10,
+    "margin_type": "ISOLATED"
+  },
+  "kill_zones_utc": {
+    "asian_session": { "start": "00:00", "end": "08:00", "weight": 0.7 },
+    "london_open": { "start": "07:00", "end": "10:00", "weight": 1.2 },
+    "new_york_open": { "start": "13:00", "end": "16:00", "weight": 1.5 },
+    "london_close": { "start": "16:00", "end": "18:00", "weight": 1.0 }
+  },
+  "risk_engine": {
+    "max_account_risk_percent": 1.0,
+    "min_reward_risk_ratio": 2.5,
+    "max_daily_drawdown_percent": 3.0,
+    "enforce_stop_loss": true,
+    "dynamic_trailing_stop": true,
+    "trailing_stop_activation_pnl_pct": 0.8,
+    "trailing_stop_distance_pct": 0.3
+  },
+  "patterns_enabled": {
+    "fair_value_gap": true,
+    "market_structure_shift": true,
+    "liquidity_sweep": true,
+    "order_block_mitigation": true,
+    "change_of_character_choch": true,
+    "breaker_blocks": true,
+    "optimal_trade_entry_ote": true
+  },
+  "copy_trade_config": {
+    "enabled": true,
+    "max_copy_allocation_usdt": 500,
+    "copy_multiplier": 1.0,
+    "auto_execute_signal": false
+  },
+  "learning_and_evaluation_engine": {
+    "history_eval_window_trades": 100,
+    "winrate_threshold_to_scale": 65.0,
+    "auto_tune_weights": true,
+    "rejection_filters": ["low_volume_sweep", "out_of_killzone", "rsi_divergence_mismatch"]
+  }
+}

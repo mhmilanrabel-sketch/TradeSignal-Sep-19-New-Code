@@ -1,0 +1,8 @@
+{
+  "name": "TradeSignals",
+  "description": "Imported from GitHub: mhmilanrabel-sketch/TradeSignal-Sep-16",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
