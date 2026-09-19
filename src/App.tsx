@@ -79,15 +79,9 @@ const BINANCE_WS_USER_ENDPOINTS = {
 const DEFAULT_API_KEY = '';
 const DEFAULT_API_SECRET = '';
 
-// ============================================================================
-// EC2 PROXY
-// ============================================================================
 const EC2_PROXY_HOST = 'https://13-60-238-187.nip.io';
 const EC2_PROXY_SECRET = 'WorldWar2026';
 
-// ============================================================================
-// TUNING
-// ============================================================================
 const MIN_CONFLUENCE_SCORE = 55;
 const MIN_KILLZONE_WEIGHT = 0.3;
 const SKIP_KILLZONE_DEFAULT = true;
@@ -348,9 +342,6 @@ export const App: React.FC = () => {
   const lossCooldownRef = useRef<Record<string, number>>({});
   const dailyPnlRef = useRef<{ day: string; pnl: number }>({ day: '', pnl: 0 });
 
-  // ==========================================================================
-  // Real candle fetcher — uses Binance klines via the EC2 proxy
-  // ==========================================================================
   const getRealCandles = async (
     symbol: string,
     interval: '1m' | '5m' | '15m' | '1h' | '4h' | '1d',
@@ -883,7 +874,6 @@ ${items.join('\n\n')}
 
     const busySymbols = new Set(currentActive.map((s) => s.symbol));
 
-    // ---- Fetch REAL candles for all whitelisted symbols in parallel ----
     const symbolsToScan = currentAssets
       .filter((a) => SCAN_WHITELIST.has(a.symbol))
       .filter((a) => !busySymbols.has(a.symbol))
@@ -998,11 +988,13 @@ ${items.join('\n\n')}
         usdtBalance: apiSettings.usdtBalance,
       });
 
+      // ✅ FIX: Store binanceQty alongside binanceOrderId so close uses the exact qty
       setSignals((prev) => prev.map((s) =>
         s.id === pos.id
           ? {
               ...s,
               ...(r.orderId ? { binanceOrderId: r.orderId } : {}),
+              ...(r.orderId ? { binanceQty: qty } : {}),
               ...(r.fillPrice ? { entryPrice: r.fillPrice, currentPrice: r.fillPrice } : {}),
               reasoning: r.success
                 ? `${s.reasoning} | Binance: ${r.orderId} qty=${qty}`
@@ -1015,6 +1007,9 @@ ${items.join('\n\n')}
     setIsScanning(false);
   };
 
+  // ==========================================================================
+  // AUTO-CLOSE — uses saved binanceQty and handles "no position" gracefully
+  // ==========================================================================
   useEffect(() => {
     if (!apiSettings.apiKey || !apiSettings.apiSecret) return;
     const justClosed = signals.filter(
@@ -1024,11 +1019,43 @@ ${items.join('\n\n')}
 
     justClosed.forEach(async (trade) => {
       binanceClosedRef.current.add(trade.id);
+
+      // ✅ FIX: Use original qty that opened the position. Fallback only if missing.
       const balance = apiSettings.usdtBalance ?? 1000;
       const dist = Math.abs(trade.entryPrice - trade.stopLoss);
-      const qty = positionSize(trade.symbol, trade.entryPrice, dist, balance);
+      const qty =
+        (trade as any).binanceQty ??
+        positionSize(trade.symbol, trade.entryPrice, dist, balance);
+
+      if (qty <= 0) {
+        console.log(`[CLOSE] ${trade.symbol}: qty=0, skipping close`);
+        return;
+      }
+
       const closeSide: 'BUY' | 'SELL' = trade.direction.includes('BUY') ? 'SELL' : 'BUY';
-      await executeBinanceOrder(trade.symbol, closeSide, qty, 'MARKET', undefined, true);
+
+      console.log(
+        `[CLOSE] Attempting to close ${trade.symbol} ${closeSide} qty=${qty} (source=${(trade as any).binanceQty ? 'saved' : 'recomputed'})`,
+      );
+
+      const r = await executeBinanceOrder(trade.symbol, closeSide, qty, 'MARKET', undefined, true);
+
+      if (!r.success && r.error) {
+        // ✅ FIX: Handle "no position" errors gracefully
+        const isNoPosition =
+          r.error.includes('-2022') ||
+          r.error.includes('-2011') ||
+          r.error.includes('ReduceOnly') ||
+          r.error.includes('no position');
+
+        if (isNoPosition) {
+          console.log(`[CLOSE] ${trade.symbol}: no position to close on Binance (already flat). Marking as handled.`);
+        } else {
+          console.warn(`[CLOSE] ${trade.symbol} close failed: ${r.error}`);
+        }
+      } else {
+        console.log(`[CLOSE] ${trade.symbol} closed successfully. OrderId: ${r.orderId}`);
+      }
     });
   }, [signals, apiSettings.apiKey, apiSettings.apiSecret]);
 
