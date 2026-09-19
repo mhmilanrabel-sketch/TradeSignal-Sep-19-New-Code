@@ -1,14 +1,14 @@
 // src/utils/alertService.ts
 // ============================================================================
-// Telegram alert service — plain-text, URL-safe, with full diagnostics.
+// Telegram alert service — plain text, URL-encoded, with diagnostics.
 // ============================================================================
 
-// ⚠️ Replace with your NEW token after revoking the one you posted publicly.
-const TELEGRAM_BOT_TOKEN = 'PASTE_YOUR_NEW_TOKEN_HERE';
+// ⚠️ This token has been posted publicly in chat. It is compromised.
+//     Revoke it in @BotFather and replace this line before going live.
+const TELEGRAM_BOT_TOKEN = '8935995466:AAG7YU-j4SeoDj5oanSDEQ2nDKbnsS8NpfM';
 
-// ⚠️ Get this from https://api.telegram.org/bot<TOKEN>/getUpdates
-//    after sending /start to your own bot. It's a NUMBER, not a username.
-const TELEGRAM_CHAT_ID = 'PASTE_YOUR_NUMERIC_CHAT_ID_HERE';
+// Your numeric chat_id, taken from your /getUpdates response.
+const TELEGRAM_CHAT_ID = '1034087034';
 
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 
@@ -16,18 +16,22 @@ const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 // Low-level sender — plain text only, no parse_mode, always URL-encoded.
 // ────────────────────────────────────────────────────────────────────────────
 async function sendTelegram(text: string): Promise<boolean> {
-  if (!TELEGRAM_BOT_TOKEN || TELEGRAM_BOT_TOKEN === 'PASTE_YOUR_NEW_TOKEN_HERE') {
-    console.warn('[telegram] Bot token not configured — skipping alert.');
+  // Guard: both values must be non-empty strings with no leftover placeholders.
+  // We do NOT compare against the literal 'PASTE_...' strings, because TS
+  // flags those comparisons as impossible once a real value is hard-coded.
+  const tokenOk = typeof TELEGRAM_BOT_TOKEN === 'string' && TELEGRAM_BOT_TOKEN.trim().length > 0;
+  const chatOk  = typeof TELEGRAM_CHAT_ID   === 'string' && TELEGRAM_CHAT_ID.trim().length   > 0;
+
+  if (!tokenOk) {
+    console.warn('[telegram] Bot token not configured.');
     return false;
   }
-  if (!TELEGRAM_CHAT_ID || TELEGRAM_CHAT_ID === 'PASTE_YOUR_NUMERIC_CHAT_ID_HERE') {
-    console.warn('[telegram] chat_id not configured — send /start to your bot, then read getUpdates.');
+  if (!chatOk) {
+    console.warn('[telegram] chat_id not configured.');
     return false;
   }
 
-  // Truncate to Telegram's 4096-char limit for sendMessage
-  const safeText = text.length > 4000 ? text.slice(0, 3990) + '…[truncated]' : text;
-
+  const safeText = text.length > 4000 ? text.slice(0, 3990) + '…' : text;
   const url = `${TELEGRAM_API}/sendMessage?chat_id=${encodeURIComponent(TELEGRAM_CHAT_ID)}&text=${encodeURIComponent(safeText)}`;
 
   try {
@@ -35,11 +39,9 @@ async function sendTelegram(text: string): Promise<boolean> {
     const body = await res.text();
 
     if (!res.ok) {
-      // Log the actual Telegram error so you can see the reason
       console.error(`[telegram] HTTP ${res.status} body: ${body.slice(0, 400)}`);
       return false;
     }
-    // Even on HTTP 200, Telegram can return {"ok":false, ...}
     try {
       const j = JSON.parse(body);
       if (!j.ok) {
@@ -48,7 +50,7 @@ async function sendTelegram(text: string): Promise<boolean> {
       }
       return true;
     } catch {
-      return true; // no parse but 200 → assume OK
+      return true;
     }
   } catch (err: any) {
     console.error(`[telegram] network error: ${err.message}`);
