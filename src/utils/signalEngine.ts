@@ -54,7 +54,7 @@ export function atr(candles: CandleData[], period = 14): number[] {
 }
 
 // ----------------------------------------------------------------------------
-// Confluence scoring — deterministic, no randomness
+// Confluence scoring
 // ----------------------------------------------------------------------------
 
 export interface ConfluenceScore {
@@ -67,9 +67,14 @@ export interface ConfluenceScore {
     emaTrend: number;
     rsi: number;
     atr: number;
+    atrPct: number;
     volumeRatio: number;
   };
 }
+
+// Minimum ATR as % of price. Below this → chop, reject trade entirely.
+const MIN_ATR_PCT = 0.0025;   // 0.25% per 5m bar
+const MAX_ATR_PCT = 0.02;     // 2.0% per 5m bar — above this = violent, reject
 
 export function scoreConfluence(candles: CandleData[]): ConfluenceScore {
   if (candles.length < 30) {
@@ -77,7 +82,7 @@ export function scoreConfluence(candles: CandleData[]): ConfluenceScore {
       total: 0,
       direction: 'NONE',
       reasons: ['Not enough candles'],
-      indicators: { emaFast: 0, emaSlow: 0, emaTrend: 0, rsi: 50, atr: 0, volumeRatio: 1 },
+      indicators: { emaFast: 0, emaSlow: 0, emaTrend: 0, rsi: 50, atr: 0, atrPct: 0, volumeRatio: 1 },
     };
   }
 
@@ -101,7 +106,30 @@ export function scoreConfluence(candles: CandleData[]): ConfluenceScore {
   const volRatio = baseVol > 0 ? recentVol / baseVol : 1;
 
   const price = closes[closes.length - 1] ?? 0;
+  const atrPct = price > 0 ? a / price : 0;
+
   const reasons: string[] = [];
+
+  // ---- HARD REJECT on bad volatility regimes ----
+  if (atrPct > 0) {
+    if (atrPct < MIN_ATR_PCT) {
+      return {
+        total: 0,
+        direction: 'NONE',
+        reasons: [`ATR too quiet (${(atrPct * 100).toFixed(3)}% < ${(MIN_ATR_PCT * 100).toFixed(2)}%) — chop, reject`],
+        indicators: { emaFast: e20, emaSlow: e50, emaTrend: e200, rsi: r, atr: a, atrPct, volumeRatio: volRatio },
+      };
+    }
+    if (atrPct > MAX_ATR_PCT) {
+      return {
+        total: 0,
+        direction: 'NONE',
+        reasons: [`ATR too volatile (${(atrPct * 100).toFixed(2)}% > ${(MAX_ATR_PCT * 100).toFixed(2)}%) — reject`],
+        indicators: { emaFast: e20, emaSlow: e50, emaTrend: e200, rsi: r, atr: a, atrPct, volumeRatio: volRatio },
+      };
+    }
+  }
+
   let longScore = 0;
   let shortScore = 0;
 
@@ -128,18 +156,13 @@ export function scoreConfluence(candles: CandleData[]): ConfluenceScore {
     if (shortScore > longScore) shortScore += 10;
   }
 
-  // 5) ATR volatility check (max 20)
-  const atrPct = a / price;
-  const healthy = atrPct > 0.0015 && atrPct < 0.02;
-  if (healthy) {
+  // 5) ATR healthy — small bonus (max 20)
+  if (atrPct >= 0.003 && atrPct <= 0.012) {
     if (longScore > shortScore) longScore += 20;
     if (shortScore > longScore) shortScore += 20;
-    reasons.push(`ATR ${(atrPct * 100).toFixed(2)}% ok`);
-  } else if (atrPct > 0.02) {
-    reasons.push('ATR too volatile');
-    longScore = shortScore = 0;
+    reasons.push(`ATR ${(atrPct * 100).toFixed(2)}% ideal`);
   } else {
-    reasons.push('ATR too quiet — chop');
+    reasons.push(`ATR ${(atrPct * 100).toFixed(2)}% ok`);
   }
 
   const winner = longScore > shortScore ? 'LONG' : shortScore > longScore ? 'SHORT' : 'NONE';
@@ -149,7 +172,7 @@ export function scoreConfluence(candles: CandleData[]): ConfluenceScore {
     total,
     direction: total >= 60 ? (winner as 'LONG' | 'SHORT') : 'NONE',
     reasons,
-    indicators: { emaFast: e20, emaSlow: e50, emaTrend: e200, rsi: r, atr: a, volumeRatio: volRatio },
+    indicators: { emaFast: e20, emaSlow: e50, emaTrend: e200, rsi: r, atr: a, atrPct, volumeRatio: volRatio },
   };
 }
 
@@ -197,7 +220,7 @@ export function buildRiskLevels(
 }
 
 // ----------------------------------------------------------------------------
-// Position sizing
+// Position sizing — respects risk AND available margin
 // ----------------------------------------------------------------------------
 
 const STEP_MAP: Record<string, number> = {
@@ -213,17 +236,33 @@ const STEP_MAP: Record<string, number> = {
   'DOT/USDT': 0.01,
 };
 
+const DEFAULT_LEVERAGE = 10;
+const MARGIN_SAFETY_FACTOR = 0.85;   // use only 85% of available margin
+
 export function positionSize(
   symbol: string,
   entry: number,
   slDist: number,
   accountBalance: number,
   riskPct = botConfig.risk_engine.max_account_risk_percent,
+  leverage: number = DEFAULT_LEVERAGE,
 ): number {
-  if (slDist <= 0 || accountBalance <= 0) return 0;
-  const riskUsd = accountBalance * (riskPct / 100);
-  const rawQty = riskUsd / slDist;
+  if (slDist <= 0 || accountBalance <= 0 || entry <= 0) return 0;
+
   const step = STEP_MAP[symbol] ?? 0.01;
+
+  // ---- 1) Quantity from risk budget ----
+  const riskUsd = accountBalance * (riskPct / 100);
+  const riskQty = riskUsd / slDist;
+
+  // ---- 2) Quantity from margin cap ----
+  // Required margin = (qty * price) / leverage. Cap at 85% of balance.
+  const maxNotionalUsd = accountBalance * leverage * MARGIN_SAFETY_FACTOR;
+  const marginQty = maxNotionalUsd / entry;
+
+  // Take the smaller of the two
+  const rawQty = Math.min(riskQty, marginQty);
+
   const qty = Math.floor(rawQty / step) * step;
-  return Math.max(Number(qty.toFixed(8)), step);
+  return Math.max(Number(qty.toFixed(8)), 0);   // don't force minimum step
 }
