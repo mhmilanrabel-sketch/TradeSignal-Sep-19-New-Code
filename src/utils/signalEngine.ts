@@ -73,7 +73,7 @@ export interface ConfluenceScore {
 }
 
 // Minimum ATR as % of price. Below this → chop, reject trade entirely.
-const MIN_ATR_PCT = 0.0030;   // ← CHANGED: was 0.0025 (0.25%) — 0.30% filters chop better
+const MIN_ATR_PCT = 0.0030;   // 0.30% per 5m bar — filters chop better than 0.25%
 const MAX_ATR_PCT = 0.02;     // 2.0% per 5m bar — above this = violent, reject
 
 export function scoreConfluence(candles: CandleData[]): ConfluenceScore {
@@ -197,6 +197,9 @@ export function isInKillZone(): { ok: boolean; name: string; weight: number } {
 
 // ----------------------------------------------------------------------------
 // ATR-scaled TP / SL
+//   ✏️ #1 FIX: SL multiplier was 1.2 — INSIDE the noise band of 5m wicks.
+//      Widened to 2.2 → SL sits outside normal pullback ranges.
+//      TP auto-scales: TP1 = slDist × min_reward_risk_ratio (unchanged)
 // ----------------------------------------------------------------------------
 
 export function buildRiskLevels(
@@ -205,8 +208,8 @@ export function buildRiskLevels(
   atrValue: number,
   cfg = botConfig.risk_engine,
 ) {
-  const slDist = atrValue * 1.2;
-  const tp1Dist = slDist * cfg.min_reward_risk_ratio;
+  const slDist = atrValue * 2.2;                      // ← was 1.2, now 2.2
+  const tp1Dist = slDist * cfg.min_reward_risk_ratio; // unchanged math
   const tp2Dist = tp1Dist * 1.6;
   const isLong = direction === 'LONG';
   return {
@@ -220,7 +223,7 @@ export function buildRiskLevels(
 }
 
 // ----------------------------------------------------------------------------
-// Position sizing
+// Position sizing — respects risk AND available margin
 // ----------------------------------------------------------------------------
 
 const STEP_MAP: Record<string, number> = {

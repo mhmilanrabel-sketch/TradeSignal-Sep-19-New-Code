@@ -1,10 +1,41 @@
-export type AssetClass = 'all' | 'crypto' | 'forex' | 'commodities' | 'stocks' | 'Crypto' | string;
+// src/types.ts
+
+export type AssetClass =
+  | 'all'
+  | 'crypto'
+  | 'forex'
+  | 'commodities'
+  | 'stocks'
+  | 'Crypto'
+  | string;
 
 export type Timeframe = '1m' | '5m' | '15m' | '1h' | '4h' | '1d';
 
-export type SignalDirection = 'STRONG_BUY' | 'BUY' | 'NEUTRAL' | 'SELL' | 'STRONG_SELL' | 'BUY (LONG)' | 'SELL (SHORT)';
+export type SignalDirection =
+  | 'STRONG_BUY'
+  | 'BUY'
+  | 'NEUTRAL'
+  | 'SELL'
+  | 'STRONG_SELL'
+  | 'BUY (LONG)'
+  | 'SELL (SHORT)';
 
-export type SignalStatus = 'ACTIVE' | 'TP1_HIT' | 'TP2_HIT' | 'TP3_HIT' | 'SL_HIT' | 'PENDING' | 'CLOSED';
+export type SignalStatus =
+  | 'ACTIVE'
+  | 'TP1_HIT'
+  | 'TP2_HIT'
+  | 'TP3_HIT'
+  | 'SL_HIT'
+  | 'PENDING'
+  | 'CLOSED';
+
+export type ClosedOutcome =
+  | 'TP1'
+  | 'TP2'
+  | 'TP3'
+  | 'SL'
+  | 'MANUAL'
+  | string;
 
 export interface ConfluenceIndicator {
   name: string;
@@ -21,9 +52,16 @@ export interface TradeSignal {
   direction: SignalDirection;
   status: SignalStatus;
   timeframe: Timeframe;
-  createdAt?: number; // timestamp
+
+  /** Epoch ms when signal was created */
+  createdAt?: number;
+  /** Human-readable timestamp string (e.g. "14:22") */
   timestamp?: string;
+  /** Epoch ms when signal was first armed / started */
+  startTime?: number;
+  /** Epoch ms when signal should auto-expire (optional) */
   expiresAt?: number;
+
   currentPrice: number;
   entryPrice: number;
   stopLoss: number;
@@ -34,11 +72,26 @@ export interface TradeSignal {
   riskRewardRatio: number;
   confidenceScore: number; // 0 - 100
   pnlPercentage: number;
+
   confluences?: ConfluenceIndicator[];
   reasoning: string;
   chartPattern?: string;
   volume24h?: string;
-  startTime?: number;
+
+  // ─────────────────────────────────────────────────────────────
+  // Binance execution metadata
+  // (Set by App.tsx when the bot actually places the order.)
+  // ─────────────────────────────────────────────────────────────
+  binanceOrderId?: string;
+  binanceQty?: number;
+  binanceSlOrderId?: string;
+  binanceTpOrderId?: string;
+
+  // ─────────────────────────────────────────────────────────────
+  // Closure metadata (populated when status === 'CLOSED')
+  // ─────────────────────────────────────────────────────────────
+  outcome?: ClosedOutcome;
+  closedAt?: number;
 }
 
 export interface CandleData {
@@ -116,7 +169,7 @@ export interface ClosedSignal {
   stopLoss?: number;
   pnlPercentage: number;
   pnlPipsOrPoints: number;
-  outcome: 'TP1' | 'TP2' | 'TP3' | 'SL' | 'MANUAL' | string;
+  outcome: ClosedOutcome;
   closedAt: string;
   holdingTime: string;
   timeStart?: string;
