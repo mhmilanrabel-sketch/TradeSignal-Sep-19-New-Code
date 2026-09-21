@@ -54,11 +54,12 @@ const DEFAULT_API_SECRET = '';
 const EC2_PROXY_HOST = 'https://13-60-238-187.nip.io';
 const EC2_PROXY_SECRET = 'WorldWar2026';
 
-const MIN_CONFLUENCE_SCORE = 55;
+// ── ✅ CHANGE 3: Raised from 55 → 65 for higher-quality entries (fewer SL hits)
+const MIN_CONFLUENCE_SCORE = 65;
 const MIN_KILLZONE_WEIGHT = 0.3;
 const SKIP_KILLZONE_DEFAULT = true;
 
-// 🛡️ SAFETY CONSTANTS
+// 🛡️ SAFETY CONSTANTS — UNCHANGED
 const MAX_ACTIVE_TRADES = 6;
 const MAX_SAME_DIRECTION = 3;
 const MAX_MARGIN_USE_PCT = 40;
@@ -67,6 +68,9 @@ const BALANCE_STALE_MS = 60_000;
 const BALANCE_REFRESH_MS = 20_000;
 const COOLDOWN_AFTER_SL_MS = 15 * 60_000;
 const MAX_CONSECUTIVE_FAILURES = 3;
+
+// ── ✅ CHANGE: 15-Minute candle-close gate. Only fire within the last 30s of a 15m bar.
+const CANDLE_CLOSE_WINDOW_SEC = 30;
 
 const SCAN_WHITELIST = new Set<string>([
   'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT',
@@ -148,6 +152,8 @@ const INITIAL_MARKET_ASSETS: MarketAsset[] = [
   { symbol: 'DOT/USDT', name: 'Polkadot Spot', price: 8.9, change24h: -0.3, high24h: 9.3, low24h: 8.6, volume24h: '14.2K', assetClass: 'Crypto' },
 ];
 
+// ── ✅ CHANGE 2: off-killzone weight is now 0 (was 1.0). The gate now actually
+//    functions when Test Mode = OFF.
 const getActiveKillZoneInfo = () => {
   const now = new Date();
   const currentTotalMins = now.getUTCHours() * 60 + now.getUTCMinutes();
@@ -167,7 +173,17 @@ const getActiveKillZoneInfo = () => {
       }
     }
   }
-  return { name: 'OFF-KILLZONE', weight: 1.0, range: 'STANDARD BIAS', isActive: false };
+  return { name: 'OFF-KILLZONE', weight: 0, range: 'STANDARD BIAS', isActive: false };
+};
+
+// ── ✅ CHANGE 1 helper: returns true only when we are inside the last N seconds
+//    of a 15-minute UTC candle boundary (00, 15, 30, 45 minutes).
+const isIn15mCandleCloseWindow = (windowSec: number = CANDLE_CLOSE_WINDOW_SEC): boolean => {
+  const now = new Date();
+  const minsIntoBar = now.getUTCMinutes() % 15;
+  const secsIntoBar = minsIntoBar * 60 + now.getUTCSeconds();
+  const secsLeftInBar = 900 - secsIntoBar;
+  return secsLeftInBar <= windowSec;
 };
 
 async function generateSignature(queryString: string, secret: string): Promise<string> {
@@ -538,9 +554,7 @@ export const App: React.FC = () => {
   };
 
   // ────────────────────────────────────────────────────────────────────────────
-  // ✅ NEW: cancelAllAlgoOrders — removes stale SL/TP orders for a symbol
-  //    Uses DELETE /fapi/v1/algoOpenOrders (Binance's cancel-all-algo endpoint).
-  //    Safe to call even when no orders exist — Binance returns 200.
+  // cancelAllAlgoOrders — removes stale SL/TP orders for a symbol
   // ────────────────────────────────────────────────────────────────────────────
   const cancelAllAlgoOrders = async (sym: string): Promise<boolean> => {
     if (!apiSettings.apiKey || !apiSettings.apiSecret) return false;
@@ -563,7 +577,6 @@ export const App: React.FC = () => {
       }
       try {
         const data = JSON.parse(text);
-        // Binance returns { code: 200, msg: "..." } on success
         return data?.code === 200 || data?.code === '200';
       } catch { return true; }
     } catch (err: any) {
@@ -651,9 +664,6 @@ export const App: React.FC = () => {
 
   // ────────────────────────────────────────────────────────────────────────────
   // executeBinanceOrderWithStops — entry MARKET + native SL/TP via ALGO API
-  //   ✅ FIX: Cancel any stale algo orders BEFORE attaching new SL/TP.
-  //   Without this, Binance rejects with -4130 ("an open stop or take profit
-  //   order with GTE and closePosition in the direction is existing").
   // ────────────────────────────────────────────────────────────────────────────
   const executeBinanceOrderWithStops = async (
     symbol: string, side: 'BUY' | 'SELL', quantity: number,
@@ -764,10 +774,7 @@ export const App: React.FC = () => {
       return { success: true, orderId: String(entry.orderId), fillPrice };
     }
 
-    // ── 3) ✅ FIX: Cancel any stale algo orders before attaching new SL/TP ──
-    //    Prevents -4130 ("open stop or take profit order ... is existing")
-    //    when a previous trade on the same symbol closed without its SL/TP
-    //    being properly cleaned up.
+    // ── 3) Cancel stale algo orders before attaching new SL/TP ──
     setConnectionLog(`🧹 Cleaning stale algo orders for ${symbol}...`);
     await cancelAllAlgoOrders(sym);
 
@@ -832,9 +839,6 @@ export const App: React.FC = () => {
 
   // ────────────────────────────────────────────────────────────────────────────
   // User Data Stream
-  //   ✅ Algo stream uses SINGLE-LETTER field codes:
-  //      o.s (not o.symbol), o.aid (not o.algoId),
-  //      o.st (not o.algoStatus), o.tp (not o.triggerPrice)
   // ────────────────────────────────────────────────────────────────────────────
   useEffect(() => {
     if (!apiSettings.apiKey || !apiSettings.enableFutures) return;
@@ -1212,6 +1216,20 @@ ${items.join('\n\n')}
       console.log(`[SCAN] ${asset.symbol}: score=${confluence.total.toFixed(0)} dir=${confluence.direction} | ${confluence.reasons.join(', ')}`);
 
       if (confluence.total < MIN_CONFLUENCE_SCORE || confluence.direction === 'NONE') continue;
+
+      // ── ✅ CHANGE 4: HTF Alignment Gate — reject counter-trend scalps.
+      //    Reuses the reasons array from scoreConfluence (no new API calls).
+      const hasBullStack = confluence.reasons.some((r) => /EMA stack bullish/i.test(r));
+      const hasBearStack = confluence.reasons.some((r) => /EMA stack bearish/i.test(r));
+      if (confluence.direction === 'LONG' && hasBearStack) {
+        console.log(`[SCAN] ${asset.symbol}: ❌ rejected — LONG against bearish EMA stack`);
+        continue;
+      }
+      if (confluence.direction === 'SHORT' && hasBullStack) {
+        console.log(`[SCAN] ${asset.symbol}: ❌ rejected — SHORT against bullish EMA stack`);
+        continue;
+      }
+
       if (confluence.direction === 'LONG' && longsQueued >= longSlots) continue;
       if (confluence.direction === 'SHORT' && shortsQueued >= shortSlots) continue;
 
@@ -1343,10 +1361,14 @@ ${items.join('\n\n')}
     });
   }, [signals, apiSettings.apiKey, apiSettings.apiSecret]);
 
+  // ── ✅ CHANGE 1: Auto-scan now only fires within the last 30 seconds of a
+  //    15-minute UTC candle (00, 15, 30, 45 min). This matches the netlify
+  //    app's TradeCountdownRule and drops entry count ~60×.
   useEffect(() => {
     if (!isAutoPilotActive) return;
     const backgroundInterval = setInterval(() => {
       if (!isScanningRef.current && assetsRef.current.length > 0 && !killSwitchRef.current) {
+        if (!isIn15mCandleCloseWindow()) return;   // ← gate
         scanFnRef.current();
       }
     }, 15000);
