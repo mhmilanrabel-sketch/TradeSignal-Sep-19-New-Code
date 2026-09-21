@@ -503,7 +503,7 @@ if (typeof window !== 'undefined') {
   } catch { /* ignore */ }
 
   // Kick off IndexedDB rehydration in the background
-  try { hydrateFromIndexedDB(); } catch { /* ignore */ }
+  try { hydrateFromIndexedDb(); } catch { /* ignore */ }
 
   console.log('%c🧠 Gemini test ready — type `await window.testGeminiKey()`', 'color:#9D4EDD; font-style:italic');
 }
