@@ -28,6 +28,7 @@ import {
   alertGeoBlock,
   alertBotStarted,
   alertBotStopped,
+  alertKillZoneChange,
 } from './utils/alertService';
 import {
   Activity, Shield, Flame, XCircle, ArrowUpRight, ArrowDownRight,
@@ -60,23 +61,32 @@ const DEFAULT_API_SECRET = '';
 const EC2_PROXY_HOST = 'https://13-60-238-187.nip.io';
 const EC2_PROXY_SECRET = 'WorldWar2026';
 
-// ── CHANGE 1: Raised 65 → 70 for higher-quality entries
 const MIN_CONFLUENCE_SCORE = 70;
 const MIN_KILLZONE_WEIGHT = 0.3;
 const SKIP_KILLZONE_DEFAULT = true;
 
-// SAFETY CONSTANTS
 const MAX_ACTIVE_TRADES = 6;
 const MAX_SAME_DIRECTION = 3;
-const MAX_MARGIN_USE_PCT = 40;
+const MAX_MARGIN_USE_PCT = 30;
 const MAX_DAILY_LOSS_PCT = 10;
 const BALANCE_STALE_MS = 60_000;
 const BALANCE_REFRESH_MS = 20_000;
 const COOLDOWN_AFTER_SL_MS = 15 * 60_000;
 const MAX_CONSECUTIVE_FAILURES = 3;
 
-// Candle-close gate window
 const CANDLE_CLOSE_WINDOW_SEC = 30;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MARKET DATA WEBSOCKET — module-level singleton
+// ═══════════════════════════════════════════════════════════════════════════
+const MARKET_WS_URLS = [
+  'wss://stream.binance.com:9443/ws/!miniTicker@arr',
+  'wss://data-stream.binance.vision/ws/!miniTicker@arr',
+] as const;
+
+let __marketWs: WebSocket | null = null;
+let __marketWsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let __marketWsUrlIndex = 0;
 
 const SCAN_WHITELIST = new Set<string>([
   'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT',
@@ -158,7 +168,6 @@ const INITIAL_MARKET_ASSETS: MarketAsset[] = [
   { symbol: 'DOT/USDT', name: 'Polkadot Spot', price: 8.9, change24h: -0.3, high24h: 9.3, low24h: 8.6, volume24h: '14.2K', assetClass: 'Crypto' },
 ];
 
-// Off-killzone weight is 0 so the gate functions when Test Mode = OFF.
 const getActiveKillZoneInfo = () => {
   const now = new Date();
   const currentTotalMins = now.getUTCHours() * 60 + now.getUTCMinutes();
@@ -254,7 +263,6 @@ export const App: React.FC = () => {
 
   const [skipKillZone, setSkipKillZone] = useState<boolean>(SKIP_KILLZONE_DEFAULT);
 
-  // CHANGE 2: AI Trade Validator toggle (persisted)
   const [aiValidatorEnabled, setAiValidatorEnabled] = useState<boolean>(() => {
     try { return localStorage.getItem('tradesignal_ai_validator') === '1'; }
     catch { return false; }
@@ -314,6 +322,7 @@ export const App: React.FC = () => {
   const killSwitchRef = useRef(killSwitchOn);
   const accountSnapshotRef = useRef<AccountSnapshot | null>(null);
   const consecutiveFailuresRef = useRef<number>(0);
+  const apiSettingsRef = useRef(apiSettings);
 
   const binanceClosedRef = useRef<Set<string>>(
     new Set(JSON.parse(localStorage.getItem('tradesignal_closed_handled_ids') || '[]')),
@@ -334,10 +343,11 @@ export const App: React.FC = () => {
 
   const exchangeInfoRef = useRef<Record<string, { stepSize: number; minQty: number; tickSize: number }>>({});
   const exchangeInfoLoadedRef = useRef<boolean>(false);
+  const lastZoneNameRef = useRef<string>('UNKNOWN');
+  // ✏️ NEW — cache of symbols whose leverage + margin type have already been
+  //   set on Binance this session, to avoid redundant API calls per entry.
+  const leverageSetRef = useRef<Set<string>>(new Set());
 
-  // ────────────────────────────────────────────────────────────────────────────
-  // KILL SWITCH
-  // ────────────────────────────────────────────────────────────────────────────
   const tripKillSwitch = (reason: string) => {
     if (killSwitchRef.current) return;
     killSwitchRef.current = true;
@@ -363,6 +373,7 @@ export const App: React.FC = () => {
   useEffect(() => { signalsRef.current = signals; }, [signals]);
   useEffect(() => { killSwitchRef.current = killSwitchOn; }, [killSwitchOn]);
   useEffect(() => { accountSnapshotRef.current = accountSnapshot; }, [accountSnapshot]);
+  useEffect(() => { apiSettingsRef.current = apiSettings; }, [apiSettings]);
 
   const loadExchangeInfo = async (): Promise<void> => {
     if (exchangeInfoLoadedRef.current) return;
@@ -429,6 +440,29 @@ export const App: React.FC = () => {
       console.warn('[balance] network err', err.message);
       return null;
     }
+  };
+
+  // ✏️ NEW — Returns absolute position size (contracts) currently open on
+  //   Binance for the given symbol. 0 if flat. Used to guard against
+  //   double-entries and stale-close rejections (-2022).
+  const checkPositionExists = async (binanceSym: string): Promise<number> => {
+    if (!apiSettings.apiKey || !apiSettings.apiSecret) return 0;
+    const baseUrl = getBaseUrl(apiSettings.environment, true);
+    const qs = `symbol=${binanceSym}&timestamp=${Date.now()}&recvWindow=10000`;
+    let sig: string;
+    try { sig = await generateSignature(qs, apiSettings.apiSecret); }
+    catch { return 0; }
+    const url = getCorsProxyUrl(`${baseUrl}/fapi/v2/positionRisk?${qs}&signature=${sig}`);
+    try {
+      const res = await fetch(url, {
+        headers: { 'X-MBX-APIKEY': apiSettings.apiKey, 'Content-Type': 'application/json' },
+      });
+      if (!res.ok) return 0;
+      const data = await res.json();
+      if (!Array.isArray(data)) return 0;
+      const row = data.find((p: any) => p.symbol === binanceSym);
+      return row ? Math.abs(parseFloat(row.positionAmt || '0')) : 0;
+    } catch { return 0; }
   };
 
   const getRealCandles = async (
@@ -522,6 +556,38 @@ export const App: React.FC = () => {
     return () => clearInterval(securityAuditInterval);
   }, [connectionStatus, apiSettings, killSwitchOn]);
 
+  // ─────────────────────────────────────────────────────────────
+  // Killzone transition watcher — fires Telegram on ENTER / EXIT
+  // ─────────────────────────────────────────────────────────────
+  useEffect(() => {
+    const check = () => {
+      const zone = getActiveKillZoneInfo();
+      const current = zone.isActive ? zone.name : 'OFF-KILLZONE';
+      const previous = lastZoneNameRef.current;
+
+      if (previous === 'UNKNOWN') {
+        lastZoneNameRef.current = current;
+        console.log(`[KILLZONE] baseline set: ${current}`);
+        return;
+      }
+
+      if (previous !== current) {
+        if (current !== 'OFF-KILLZONE') {
+          alertKillZoneChange('ENTER', zone.name, zone.range, zone.weight, apiSettings.environment);
+          console.log(`[KILLZONE] ENTER ${zone.name} (${zone.range}, w=${zone.weight})`);
+        } else {
+          alertKillZoneChange('EXIT', previous, '', 0, apiSettings.environment);
+          console.log(`[KILLZONE] EXIT → ${current}`);
+        }
+        lastZoneNameRef.current = current;
+      }
+    };
+
+    check();
+    const t = setInterval(check, 30_000);
+    return () => clearInterval(t);
+  }, [apiSettings.environment]);
+
   const obtainListenKey = async (): Promise<string | null> => {
     if (listenKeyFatalRef.current || listenKeyAttemptedRef.current) return null;
     listenKeyAttemptedRef.current = true;
@@ -566,9 +632,6 @@ export const App: React.FC = () => {
     } catch { return false; }
   };
 
-  // ────────────────────────────────────────────────────────────────────────────
-  // CHANGE 3: cancelAllAlgoOrders — HARDENED for demo's async propagation.
-  // ────────────────────────────────────────────────────────────────────────────
   const cancelAllAlgoOrders = async (sym: string): Promise<boolean> => {
     if (!apiSettings.apiKey || !apiSettings.apiSecret) return false;
     const baseUrl = getBaseUrl(apiSettings.environment, true);
@@ -600,23 +663,19 @@ export const App: React.FC = () => {
       }
     };
 
-    // Step 1 — bulk cancel (fast path)
-    await signAndCall('DELETE', '/fapi/v1/algoOpenOrders', { symbol: sym });
-
-    // Step 2 — list any leftover open orders and cancel individually
-    const open = await signAndCall('GET', '/fapi/v1/openOrders', { symbol: sym });
+    const open = await signAndCall('GET', '/fapi/v1/openAlgoOrders', { symbol: sym });
     if (Array.isArray(open) && open.length > 0) {
-      console.warn(`[cancelAlgo] ${sym}: ${open.length} leftover order(s) still alive — cancelling individually`);
+      console.log(`[cancelAlgo] ${sym}: cancelling ${open.length} open algo order(s)`);
       for (const o of open) {
-        if (!o?.orderId) continue;
-        await signAndCall('DELETE', '/fapi/v1/order', {
+        const algoId = o?.algoId ?? o?.clientAlgoId;
+        if (!algoId) continue;
+        await signAndCall('DELETE', '/fapi/v1/algoOrder', {
           symbol: sym,
-          orderId: String(o.orderId),
+          algoId: String(algoId),
         });
       }
     }
 
-    // Step 3 — let the exchange propagate the cancels before the next POST
     await new Promise((r) => setTimeout(r, 400));
     return true;
   };
@@ -695,10 +754,6 @@ export const App: React.FC = () => {
     return { success: false, error: lastErrMsg };
   };
 
-  // ────────────────────────────────────────────────────────────────────────────
-  // CHANGE 4: executeBinanceOrderWithStops — SL/TP wrapped in sendAlgoWithRetry
-  //   which auto-retries on -4130 (demo's async cancel propagation).
-  // ────────────────────────────────────────────────────────────────────────────
   const executeBinanceOrderWithStops = async (
     symbol: string, side: 'BUY' | 'SELL', quantity: number,
     stopLoss: number, takeProfit: number,
@@ -748,18 +803,71 @@ export const App: React.FC = () => {
       } catch (err: any) { return { err: err.message }; }
     };
 
+    const setLeverage = async (s: string, lev: number): Promise<boolean> => {
+      const qs = `symbol=${s}&leverage=${lev}&timestamp=${Date.now()}&recvWindow=10000`;
+      let sig: string;
+      try { sig = await generateSignature(qs, apiSettings.apiSecret); }
+      catch { return false; }
+      const url = getCorsProxyUrl(`${baseUrl}/fapi/v1/leverage?${qs}&signature=${sig}`);
+      try {
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'X-MBX-APIKEY': apiSettings.apiKey, 'Content-Type': 'application/json' },
+        });
+        if (!res.ok) {
+          const t = await res.text();
+          console.warn(`[setLeverage] ${s} HTTP ${res.status}: ${t.slice(0, 200)}`);
+          return false;
+        }
+        console.log(`[setLeverage] ${s} → ${lev}x`);
+        return true;
+      } catch (err: any) {
+        console.warn(`[setLeverage] ${s} network err: ${err.message}`);
+        return false;
+      }
+    };
+
+    const setMarginTypeIsolated = async (s: string): Promise<boolean> => {
+      const qs = `symbol=${s}&marginType=ISOLATED&timestamp=${Date.now()}&recvWindow=10000`;
+      let sig: string;
+      try { sig = await generateSignature(qs, apiSettings.apiSecret); }
+      catch { return false; }
+      const url = getCorsProxyUrl(`${baseUrl}/fapi/v1/marginType?${qs}&signature=${sig}`);
+      try {
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'X-MBX-APIKEY': apiSettings.apiKey, 'Content-Type': 'application/json' },
+        });
+        if (!res.ok) {
+          const t = await res.text();
+          if (!t.includes('-4046')) {
+            console.warn(`[setMarginType] ${s} HTTP ${res.status}: ${t.slice(0, 200)}`);
+            return false;
+          }
+        }
+        console.log(`[setMarginType] ${s} → ISOLATED`);
+        return true;
+      } catch (err: any) {
+        console.warn(`[setMarginType] ${s} network err: ${err.message}`);
+        return false;
+      }
+    };
+
     const sendAlgoOrder = async (params: Record<string, string>) => {
       if (!isFutures) return { err: 'Algo orders are futures-only' };
+
       const algoParams: Record<string, string> = {
         ...params,
         algoType: 'CONDITIONAL',
         timestamp: Date.now().toString(),
         recvWindow: '10000',
       };
+
       const qs = Object.entries(algoParams).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&');
       let sig: string;
       try { sig = await generateSignature(qs, apiSettings.apiSecret); }
       catch (err: any) { return { err: `Signature error: ${err.message}` }; }
+
       const url = getCorsProxyUrl(`${baseUrl}/fapi/v1/algoOrder?${qs}&signature=${sig}`);
       try {
         const res = await fetch(url, {
@@ -778,20 +886,26 @@ export const App: React.FC = () => {
       } catch (err: any) { return { err: err.message }; }
     };
 
-    // ✅ CHANGE 4: retry wrapper for -4130
     const sendAlgoWithRetry = async (params: Record<string, string>) => {
-      let first = await sendAlgoOrder(params);
-      if (first?.algoId) return first;
-      if (String(first?.code) === '-4130') {
-        console.warn(`[algoOrder] -4130 hit, re-running hard cleanup on ${sym} then retrying once`);
-        await cancelAllAlgoOrders(sym);
-        await new Promise((r) => setTimeout(r, 700));
-        first = await sendAlgoOrder(params);
+      let r = await sendAlgoOrder(params);
+      if (r?.algoId) return r;
+      const code = String(r?.code ?? '');
+      if (code === '-2021' || code === '-1111' || code === '-4130' || code === '-4120') {
+        console.warn(`[algoOrder] retry after ${code} on ${params.symbol} ${params.type}`);
+        await new Promise((res) => setTimeout(res, 600));
+        r = await sendAlgoOrder(params);
       }
-      return first;
+      return r;
     };
 
-    // ── 1) ENTRY MARKET ──
+    // ✏️ NEW — only set leverage + margin type once per symbol per session.
+    if (isFutures && !leverageSetRef.current.has(sym)) {
+      const configuredLeverage = botConfig.binance_config.leverage || 10;
+      await setLeverage(sym, configuredLeverage);
+      await setMarginTypeIsolated(sym);
+      leverageSetRef.current.add(sym);
+    }
+
     const entryParams: Record<string, string> = {
       symbol: sym, side, type: 'MARKET', quantity: roundedQty.toString(),
     };
@@ -811,7 +925,24 @@ export const App: React.FC = () => {
       return { success: false, error: errMsg };
     }
     consecutiveFailuresRef.current = 0;
-    const fillPrice = parseFloat(entry.avgPrice || entry.price || '0') || undefined;
+
+    let fillPrice = parseFloat(entry.avgPrice || entry.price || '0') || undefined;
+    if (!fillPrice && entry.orderId) {
+      try {
+        const detailQs = `symbol=${sym}&orderId=${entry.orderId}&timestamp=${Date.now()}&recvWindow=10000`;
+        const detailSig = await generateSignature(detailQs, apiSettings.apiSecret);
+        const detailUrl = getCorsProxyUrl(`${baseUrl}/fapi/v1/order?${detailQs}&signature=${detailSig}`);
+        const detailRes = await fetch(detailUrl, {
+          headers: { 'X-MBX-APIKEY': apiSettings.apiKey, 'Content-Type': 'application/json' },
+        });
+        if (detailRes.ok) {
+          const d = await detailRes.json();
+          const p = parseFloat(d.avgPrice || d.price || '0');
+          if (p > 0) fillPrice = p;
+        }
+      } catch { /* non-fatal */ }
+    }
+
     setConnectionLog(`ORDER PLACED: ${side} ${roundedQty} ${symbol} | ID: ${entry.orderId}${fillPrice ? ` | Fill: $${fillPrice}` : ''}`);
 
     if (!isFutures) {
@@ -855,7 +986,7 @@ export const App: React.FC = () => {
       const reasons: string[] = [];
       if (!slOk) reasons.push(`SL: [${slResult.code ?? '?'}] ${slResult.msg ?? slResult.err}`);
       if (!tpOk) reasons.push(`TP: [${tpResult.code ?? '?'}] ${tpResult.msg ?? tpResult.err}`);
-      setConnectionLog(`🔴 NATIVE ATTACH FAILED for ${symbol} — EMERGENCY CLOSING. ${reasons.join(' | ')}`);
+      setConnectionLog(`🔴 ALGO ATTACH FAILED for ${symbol} — EMERGENCY CLOSING. ${reasons.join(' | ')}`);
 
       const emergency = await executeBinanceOrder(symbol, closeSide, roundedQty, 'MARKET', undefined, true);
       if (!emergency.success) {
@@ -870,7 +1001,7 @@ export const App: React.FC = () => {
     }
 
     setConnectionLog(
-      `✅ Native SL/TP attached for ${symbol} | SL algoId:${slResult.algoId} TP algoId:${tpResult.algoId} (Binance holds the stop)`,
+      `✅ Algo SL/TP attached for ${symbol} | SL algoId:${slResult.algoId} TP algoId:${tpResult.algoId} (Binance holds the stop)`,
     );
     await refreshAccountSnapshot();
     return {
@@ -879,9 +1010,6 @@ export const App: React.FC = () => {
     };
   };
 
-  // ────────────────────────────────────────────────────────────────────────────
-  // User Data Stream
-  // ────────────────────────────────────────────────────────────────────────────
   useEffect(() => {
     if (!apiSettings.apiKey || !apiSettings.enableFutures) return;
     if (listenKeyFatalRef.current) return;
@@ -1256,10 +1384,8 @@ ${items.join('\n\n')}
       const confluence = scoreConfluence(candles);
       console.log(`[SCAN] ${asset.symbol}: 5m score=${confluence.total.toFixed(0)} dir=${confluence.direction} | ${confluence.reasons.join(', ')}`);
 
-      // Gate A — 5m must reach threshold
       if (confluence.total < MIN_CONFLUENCE_SCORE || confluence.direction === 'NONE') continue;
 
-      // CHANGE 5: Gate B — 15m trend must AGREE with 5m direction
       const { candles: candles15m } = await getRealCandles(asset.symbol, '15m', 60);
       if (candles15m.length < 30) {
         console.log(`[SCAN] ${asset.symbol}: ⏸ 15m candles insufficient (${candles15m.length})`);
@@ -1276,7 +1402,6 @@ ${items.join('\n\n')}
         continue;
       }
 
-      // CHANGE 5: Gate C — 1h trend must NOT be actively opposed (NEUTRAL OK)
       const { candles: candles1h } = await getRealCandles(asset.symbol, '1h', 60);
       let trend1h = { total: 0, direction: 'NONE' as 'LONG' | 'SHORT' | 'NONE', reasons: [] as string[] };
       if (candles1h.length >= 30) {
@@ -1292,18 +1417,13 @@ ${items.join('\n\n')}
         }
       }
 
-      // Gate D — direction slot availability
       if (confluence.direction === 'LONG' && longsQueued >= longSlots) continue;
       if (confluence.direction === 'SHORT' && shortsQueued >= shortSlots) continue;
 
-      // CHANGE 5: Gate E — optional AI second opinion for BORDERLINE setups
       let aiMultiplier = 1.0;
       let aiReasoning = '';
-      if (
-        aiValidatorEnabled &&
-        confluence.total >= MIN_CONFLUENCE_SCORE &&
-        confluence.total < 85
-      ) {
+      // ✏️ NEW — AI now runs on ALL setups ≥ MIN_CONFLUENCE_SCORE (was capped < 85)
+      if (aiValidatorEnabled && confluence.total >= MIN_CONFLUENCE_SCORE) {
         const recentTrades: AiRecentTrade[] = signals
           .filter((s) => s.status === 'CLOSED')
           .slice(0, 8)
@@ -1313,6 +1433,18 @@ ${items.join('\n\n')}
             outcome: (s as any).outcome || 'CLOSED',
             pnlPct: Number((s.pnlPercentage ?? 0).toFixed(2)),
           }));
+
+        // ✏️ NEW — compute rolling win rate + loss streak over last 20 closed trades
+        const last20 = signals.filter((s) => s.status === 'CLOSED').slice(0, 20);
+        const wins20 = last20.filter((s) => (s.pnlPercentage ?? 0) > 0).length;
+        const winRate20 = last20.length > 0
+          ? Number(((wins20 / last20.length) * 100).toFixed(1))
+          : 0;
+        let lossStreak = 0;
+        for (const s of last20) {
+          if ((s.pnlPercentage ?? 0) <= 0) lossStreak++;
+          else break;
+        }
 
         const tmpRisk = buildRiskLevels(confluence.direction, asset.price, confluence.indicators.atr);
         const aiCtx: AiTradeContext = {
@@ -1335,9 +1467,11 @@ ${items.join('\n\n')}
           recentTrades,
           killZoneName: zone.name,
           killZoneWeight: zone.weight,
+          recentWinRatePct: winRate20,
+          recentLossStreak: lossStreak,
         };
 
-        console.log(`[AI] ${asset.symbol}: requesting second opinion (score ${Math.round(confluence.total)})`);
+        console.log(`[AI] ${asset.symbol}: requesting second opinion (score ${Math.round(confluence.total)}, WR ${winRate20}%, streak ${lossStreak})`);
         const aiResult = await validateTradeWithAi(aiCtx, 6000);
 
         if (aiResult) {
@@ -1404,7 +1538,14 @@ ${items.join('\n\n')}
       }
 
       const dist = Math.abs(pos.entryPrice - pos.stopLoss);
-      const baseQty = positionSize(pos.symbol, pos.entryPrice, dist, liveSnapshot.availableBalance);
+      const baseQty = positionSize(
+        pos.symbol,
+        pos.entryPrice,
+        dist,
+        liveSnapshot.availableBalance,
+        botConfig.risk_engine.max_account_risk_percent,
+        botConfig.binance_config.leverage,
+      );
       const multiplier = aiMultiplierMap[pos.id] ?? 1.0;
       const qty = Number((baseQty * multiplier).toFixed(8));
       if (qty <= 0) continue;
@@ -1412,7 +1553,7 @@ ${items.join('\n\n')}
         setConnectionLog(`⚖️ ${pos.symbol} position halved by AI (${multiplier}x)`);
       }
 
-      const leverage = botConfig.binance_config.leverage || 1;
+      const leverage = botConfig.binance_config.leverage || 10;
       const notional = qty * pos.entryPrice;
       const requiredMargin = notional / leverage;
       const maxAllowedMargin = (liveSnapshot.availableBalance * MAX_MARGIN_USE_PCT) / 100;
@@ -1421,6 +1562,35 @@ ${items.join('\n\n')}
           `⛔ ${pos.symbol} skipped — order margin $${requiredMargin.toFixed(2)} > ` +
           `${MAX_MARGIN_USE_PCT}% of free margin ($${maxAllowedMargin.toFixed(2)}).`
         );
+        continue;
+      }
+
+      // ✏️ NEW — Price-drift guard: reject if price already moved >0.4%
+      //    in our direction since the scoring candle closed. Prevents chasing.
+      const liveAsset = assetsRef.current.find((a) => a.symbol === pos.symbol);
+      const livePrice = liveAsset?.price ?? pos.entryPrice;
+      const driftPct = pos.direction.includes('BUY')
+        ? (livePrice - pos.entryPrice) / pos.entryPrice
+        : (pos.entryPrice - livePrice) / pos.entryPrice;
+      if (driftPct > 0.004) {
+        setConnectionLog(
+          `❌ ${pos.symbol} rejected — price already moved ${(driftPct * 100).toFixed(2)}% ` +
+          `(chasing). Entry was $${pos.entryPrice}, now $${livePrice}.`
+        );
+        setSignals((prev) => prev.filter((s) => s.id !== pos.id));
+        signalsRef.current = signalsRef.current.filter((s) => s.id !== pos.id);
+        continue;
+      }
+
+      // ✏️ NEW — Position-exists guard: skip if a position already exists on
+      //    this symbol (manual trade, prior close still settling, etc.)
+      const existingPos = await checkPositionExists(pos.symbol.replace('/', '').toUpperCase());
+      if (existingPos > 0) {
+        setConnectionLog(
+          `⛔ ${pos.symbol} skipped — position already exists (${existingPos} units open).`
+        );
+        setSignals((prev) => prev.filter((s) => s.id !== pos.id));
+        signalsRef.current = signalsRef.current.filter((s) => s.id !== pos.id);
         continue;
       }
 
@@ -1479,6 +1649,15 @@ ${items.join('\n\n')}
       markClosedHandled(trade.id);
       const balance = accountSnapshotRef.current?.availableBalance ?? 0;
       if (balance <= 0) return;
+
+      // ✏️ NEW — Skip if Binance already closed this position (SL/TP fired
+      //    first, or manual close). Prevents -2022 ReduceOnly rejections.
+      const existing = await checkPositionExists(trade.symbol.replace('/', '').toUpperCase());
+      if (existing <= 0) {
+        console.log(`[CLOSE] ${trade.symbol} already closed on Binance — skipping reduceOnly order`);
+        return;
+      }
+
       const dist = Math.abs(trade.entryPrice - trade.stopLoss);
       const qty = (trade as any).binanceQty ?? positionSize(trade.symbol, trade.entryPrice, dist, balance);
       if (qty <= 0) return;
@@ -1503,14 +1682,17 @@ ${items.join('\n\n')}
   }, [isAutoPilotActive]);
 
   useEffect(() => {
-    let isSubscribed = true;
-    const ws = new WebSocket('wss://stream.binance.com:9443/ws/!miniTicker@arr');
-    ws.onopen = () => { if (isSubscribed) setConnectionStatus('LIVE'); };
-    ws.onmessage = (event) => {
-      if (!isSubscribed) return;
+    let cancelled = false;
+
+    const handleOpen = () => { if (!cancelled) setConnectionStatus('LIVE'); };
+    const handleError = () => { if (!cancelled) setConnectionStatus('DISCONNECTED'); };
+
+    const handleMessage = (event: MessageEvent) => {
+      if (cancelled) return;
       try {
         const rawData = JSON.parse(event.data);
         if (!Array.isArray(rawData)) return;
+
         setAssets((prev) => {
           const updated = [...prev];
           rawData.forEach((item: any) => {
@@ -1532,6 +1714,7 @@ ${items.join('\n\n')}
           });
           return updated;
         });
+
         setSignals((prev) => prev.map((sig) => {
           if (sig.status !== 'ACTIVE') return sig;
           const match = rawData.find((item: any) => item.s === sig.symbol.replace('/', '').toUpperCase());
@@ -1552,42 +1735,82 @@ ${items.join('\n\n')}
               if (!stopLoss || t < stopLoss) stopLoss = t;
             }
           }
-          let isSL = false, isTP = false;
-          if (isLong) {
-            if (stopLoss && livePrice <= stopLoss) isSL = true;
-            if ((sig.takeProfit1 && livePrice >= sig.takeProfit1) || (sig.takeProfit2 && livePrice >= sig.takeProfit2)) isTP = true;
-          } else {
-            if (stopLoss && livePrice >= stopLoss) isSL = true;
-            if ((sig.takeProfit1 && livePrice <= sig.takeProfit1) || (sig.takeProfit2 && livePrice <= sig.takeProfit2)) isTP = true;
-          }
-          if (isSL || isTP) {
-            const outcome: 'TP1' | 'TP2' | 'SL' = isSL ? 'SL' : 'TP1';
-            recordClosedSignalToJournal(sig, livePrice, outcome, Number(rawPnl.toFixed(2)));
-            alertTradeClosed({
-              symbol: sig.symbol, direction: sig.direction,
-              entryPrice: sig.entryPrice, exitPrice: livePrice,
-              pnlPercentage: Number(rawPnl.toFixed(2)), outcome,
-              duration: formatDuration((sig as any).startTime || Date.now()),
-              environment: apiSettings.environment,
-            });
-            if (isSL) {
-              lossCooldownRef.current[sig.symbol] = Date.now();
-              dailyPnlRef.current.pnl -= Math.abs(rawPnl);
+          const hasNativeStops = Boolean((sig as any).binanceSlOrderId && (sig as any).binanceTpOrderId);
+          if (!hasNativeStops) {
+            let isSL = false, isTP = false;
+            if (isLong) {
+              if (stopLoss && livePrice <= stopLoss) isSL = true;
+              if ((sig.takeProfit1 && livePrice >= sig.takeProfit1) || (sig.takeProfit2 && livePrice >= sig.takeProfit2)) isTP = true;
             } else {
-              dailyPnlRef.current.pnl += Math.abs(rawPnl);
+              if (stopLoss && livePrice >= stopLoss) isSL = true;
+              if ((sig.takeProfit1 && livePrice <= sig.takeProfit1) || (sig.takeProfit2 && livePrice <= sig.takeProfit2)) isTP = true;
             }
-            if (dailyPnlRef.current.pnl <= -MAX_DAILY_LOSS_PCT) {
-              tripKillSwitch(`Daily loss ${dailyPnlRef.current.pnl.toFixed(2)}% ≤ -${MAX_DAILY_LOSS_PCT}%`);
+            if (isSL || isTP) {
+              const outcome: 'TP1' | 'TP2' | 'SL' = isSL ? 'SL' : 'TP1';
+              recordClosedSignalToJournal(sig, livePrice, outcome, Number(rawPnl.toFixed(2)));
+              alertTradeClosed({
+                symbol: sig.symbol, direction: sig.direction,
+                entryPrice: sig.entryPrice, exitPrice: livePrice,
+                pnlPercentage: Number(rawPnl.toFixed(2)), outcome,
+                duration: formatDuration((sig as any).startTime || Date.now()),
+                environment: apiSettingsRef.current.environment,
+              });
+              if (isSL) {
+                lossCooldownRef.current[sig.symbol] = Date.now();
+                dailyPnlRef.current.pnl -= Math.abs(rawPnl);
+              } else {
+                dailyPnlRef.current.pnl += Math.abs(rawPnl);
+              }
+              if (dailyPnlRef.current.pnl <= -MAX_DAILY_LOSS_PCT) {
+                tripKillSwitch(`Daily loss ${dailyPnlRef.current.pnl.toFixed(2)}% ≤ -${MAX_DAILY_LOSS_PCT}%`);
+              }
+              return { ...sig, currentPrice: livePrice, stopLoss, pnlPercentage: Number(rawPnl.toFixed(2)), status: 'CLOSED' as const };
             }
-            return { ...sig, currentPrice: livePrice, stopLoss, pnlPercentage: Number(rawPnl.toFixed(2)), status: 'CLOSED' as const };
           }
           return { ...sig, currentPrice: livePrice, stopLoss, pnlPercentage: Number(rawPnl.toFixed(2)) };
         }));
-      } catch (e) { console.error('Binance WS parse error:', e); }
+      } catch (e) {
+        console.error('Binance WS parse error:', e);
+      }
     };
-    ws.onerror = () => { if (isSubscribed) setConnectionStatus('DISCONNECTED'); };
-    ws.onclose = () => { if (isSubscribed) setConnectionStatus('DISCONNECTED'); };
-    return () => { isSubscribed = false; ws.close(); };
+
+    const handleClose = () => {
+      __marketWs = null;
+      if (cancelled) return;
+      setConnectionStatus('DISCONNECTED');
+      __marketWsUrlIndex = (__marketWsUrlIndex + 1) % MARKET_WS_URLS.length;
+      if (__marketWsReconnectTimer) clearTimeout(__marketWsReconnectTimer);
+      __marketWsReconnectTimer = setTimeout(connect, 3000);
+    };
+
+    const connect = () => {
+      if (cancelled) return;
+      if (__marketWs && (__marketWs.readyState === WebSocket.OPEN || __marketWs.readyState === WebSocket.CONNECTING)) {
+        __marketWs.onopen = handleOpen;
+        __marketWs.onmessage = handleMessage;
+        __marketWs.onerror = handleError;
+        __marketWs.onclose = handleClose;
+        if (__marketWs.readyState === WebSocket.OPEN) setConnectionStatus('LIVE');
+        return;
+      }
+      const url = MARKET_WS_URLS[__marketWsUrlIndex];
+      const ws = new WebSocket(url);
+      __marketWs = ws;
+      ws.onopen = handleOpen;
+      ws.onmessage = handleMessage;
+      ws.onerror = handleError;
+      ws.onclose = handleClose;
+    };
+
+    connect();
+
+    return () => {
+      cancelled = true;
+      if (__marketWsReconnectTimer) {
+        clearTimeout(__marketWsReconnectTimer);
+        __marketWsReconnectTimer = null;
+      }
+    };
   }, []);
 
   const handleCloseTrade = (tradeId: string) => {
@@ -2014,7 +2237,7 @@ ${items.join('\n\n')}
                     AI Trade Validator (Gemini)
                   </span>
                   <span className="text-[11px] text-slate-400">
-                    Borderline setups (score 70–84) get a second opinion. Requires <code className="text-purple-300">VITE_GEMINI_API_KEY</code> in <code>.env.local</code>.
+                    Every setup ≥ 70 gets a second opinion. Requires <code className="text-purple-300">#gk=KEY</code> in URL.
                   </span>
                 </div>
                 <button
@@ -2058,7 +2281,7 @@ ${items.join('\n\n')}
                 <div>
                   <span className="text-xs font-bold text-white block">Market Type</span>
                   <span className="text-[11px] text-slate-400">
-                    {apiSettings.enableFutures ? 'USDT-M Futures (Algo SL/TP)' : 'Spot Trading (app-managed SL/TP)'}
+                    {apiSettings.enableFutures ? 'USDT-M Futures (Algo SL/TP via /fapi/v1/algoOrder)' : 'Spot Trading (app-managed SL/TP)'}
                   </span>
                 </div>
                 <button
@@ -2118,8 +2341,10 @@ ${items.join('\n\n')}
             <div className="border-t border-slate-800 pt-5">
               <h4 className="text-xs font-bold text-white mb-2">🛡️ Safety Layers Active</h4>
               <div className="text-[11px] text-slate-400 space-y-1 font-mono">
-                <div>✅ Algo SL/TP via /fapi/v1/algoOrder (algoType=CONDITIONAL)</div>
-                <div>✅ Stale algo orders cancelled before every new attach (retry on -4130)</div>
+                <div>✅ Leverage set on Binance once per symbol ({botConfig.binance_config.leverage}x)</div>
+                <div>✅ Margin type set to ISOLATED (self-contained collateral per trade)</div>
+                <div>✅ Algo SL/TP via /fapi/v1/algoOrder (algoType=CONDITIONAL, triggerPrice, closePosition=true)</div>
+                <div>✅ Stale algo orders cancelled before every new attach</div>
                 <div>✅ Hard block if balance unknown or stale (&gt;60s)</div>
                 <div>✅ Direction cap: max {MAX_SAME_DIRECTION} longs / {MAX_SAME_DIRECTION} shorts</div>
                 <div>✅ Free-margin guard: ≤{MAX_MARGIN_USE_PCT}% of available per order</div>
@@ -2127,9 +2352,14 @@ ${items.join('\n\n')}
                 <div>✅ Kill switch tripped by -{MAX_DAILY_LOSS_PCT}% daily loss, {MAX_CONSECUTIVE_FAILURES} failures, or manual</div>
                 <div>✅ Balance re-read between every order in a batch</div>
                 <div>✅ Quantity floored to LOT_SIZE, triggerPrice to PRICE_FILTER</div>
+                <div>✅ Fill price resolved from /fapi/v1/order when POST omits avgPrice</div>
+                <div>✅ Price-drift guard: skip entries if price moved &gt;0.4% since scoring</div>
+                <div>✅ Position-exists guard: skip entries if symbol already has an open position</div>
+                <div>✅ Pre-close check avoids -2022 ReduceOnly rejections</div>
                 <div>✅ 15m + 1h trend confirmation gates before every entry</div>
                 <div>✅ 15-minute candle-close window (last 30s only)</div>
-                <div>{aiValidatorEnabled ? '✅ AI Trade Validator ON (Gemini second opinion on borderline setups)' : '⏸ AI Trade Validator OFF'}</div>
+                <div>✅ Killzone ENTER/EXIT alerts to Telegram</div>
+                <div>{aiValidatorEnabled ? '✅ AI Trade Validator ON (fires on every setup ≥ 70)' : '⏸ AI Trade Validator OFF'}</div>
               </div>
             </div>
 
@@ -2141,6 +2371,7 @@ ${items.join('\n\n')}
                 <div>✅ Daily drawdown hit → Telegram</div>
                 <div>✅ Geo-block detected → Telegram</div>
                 <div>✅ Bot start/stop → Telegram</div>
+                <div>✅ Killzone enter/exit → Telegram</div>
               </div>
             </div>
 

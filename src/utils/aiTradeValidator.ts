@@ -1,12 +1,6 @@
 // src/utils/aiTradeValidator.ts
 // ============================================================================
 // AI Trade Validator — Gemini REST API (no SDK dependency).
-//
-// ✅ Uses the NEW-format Gemini API keys (AQ.Ab8RN6...) which must be sent
-//    in the "x-goog-api-key" HEADER, not as a "?key=" URL query parameter.
-//
-// Called ONLY for borderline setups (score 70–84).
-// Returns null on any failure so the caller falls back to rules-only.
 // ============================================================================
 
 export type AiVerdict = 'APPROVE' | 'CAUTION' | 'REJECT';
@@ -38,6 +32,9 @@ export interface AiTradeContext {
   recentTrades: AiRecentTrade[];
   killZoneName: string;
   killZoneWeight: number;
+  // ── NEW ──
+  recentWinRatePct: number;    // win rate of last 20 closed trades
+  recentLossStreak: number;    // consecutive losses at head of last 20
 }
 
 export interface AiValidationResult {
@@ -63,6 +60,12 @@ Historical failure patterns you MUST guard against:
 5. Entering when the daily P&L is already > -3% (bot is "tilted", should slow down)
 6. Entering in off-killzone hours (Asian session low liquidity)
 
+Additional context you receive:
+- botState.recentWinRatePct: win rate of the bot's last 20 closed trades
+- botState.recentLossStreak: consecutive losses at the head of that window
+- If recentLossStreak >= 3, be MORE conservative — the bot may be misreading the regime
+- If recentWinRatePct < 40, lean toward CAUTION even on clean setups
+
 Decision rules:
 - APPROVE: 5m, 15m, and (if directional) 1h all agree. Setup is clean.
 - CAUTION: mixed signals — e.g. 5m and 15m agree but 1h is neutral or mildly opposed.
@@ -79,11 +82,45 @@ You MUST respond with ONLY valid JSON in this exact shape:
 
 Do not include markdown. Do not include explanations outside the JSON.`;
 
+const LS_KEY_NAME = 'VITE_GEMINI_API_KEY';
+const SS_KEY_NAME = 'tradesignal_gemini_key';
+
+// ────────────────────────────────────────────────────────────────────────────
+// Key resolution — env → global → URL hash → localStorage → sessionStorage.
+// ────────────────────────────────────────────────────────────────────────────
 function getGeminiApiKey(): string {
   try {
     const env: any = (import.meta as any)?.env ?? {};
-    const key = env.VITE_GEMINI_API_KEY || env.GEMINI_API_KEY || '';
-    return typeof key === 'string' ? key.trim() : '';
+    const fromEnv = env.VITE_GEMINI_API_KEY || env.GEMINI_API_KEY || '';
+    if (typeof fromEnv === 'string' && fromEnv.trim().length > 0) {
+      return fromEnv.trim();
+    }
+
+    if (typeof window !== 'undefined') {
+      const g = (window as any).__GEMINI_API_KEY__;
+      if (typeof g === 'string' && g.trim().length > 0) return g.trim();
+    }
+
+    if (typeof window !== 'undefined' && window.location.hash) {
+      const m = window.location.hash.match(/(?:^|[#&])gk=([^&]+)/);
+      if (m && m[1]) return decodeURIComponent(m[1]).trim();
+    }
+
+    if (typeof window !== 'undefined') {
+      try {
+        const ls = window.localStorage.getItem(LS_KEY_NAME);
+        if (ls && ls.trim().length > 0) return ls.trim();
+      } catch { /* localStorage blocked */ }
+    }
+
+    if (typeof window !== 'undefined') {
+      try {
+        const ss = window.sessionStorage.getItem(SS_KEY_NAME);
+        if (ss && ss.trim().length > 0) return ss.trim();
+      } catch { /* sessionStorage blocked */ }
+    }
+
+    return '';
   } catch {
     return '';
   }
@@ -93,13 +130,9 @@ export function isAiValidatorConfigured(): boolean {
   return getGeminiApiKey().length > 0;
 }
 
-const GEMINI_MODEL = 'gemini-2.0-flash';
+const GEMINI_MODEL = 'gemini-2.5-flash';
 const GEMINI_ENDPOINT_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
 
-// ────────────────────────────────────────────────────────────────────────────
-// ✅ FIXED: uses x-goog-api-key header instead of ?key= URL param.
-//    Works with BOTH new-format (AQ.Ab8RN6...) and legacy (AIzaSy...) keys.
-// ────────────────────────────────────────────────────────────────────────────
 async function callGeminiRest(
   apiKey: string,
   systemPrompt: string,
@@ -108,7 +141,7 @@ async function callGeminiRest(
   const url = `${GEMINI_ENDPOINT_BASE}/${GEMINI_MODEL}:generateContent`;
 
   const body = {
-    system_instruction: {
+    systemInstruction: {
       parts: [{ text: systemPrompt }],
     },
     contents: [
@@ -137,7 +170,7 @@ async function callGeminiRest(
     const text = await res.text();
 
     if (!res.ok) {
-      console.warn(`[aiValidator] Gemini HTTP ${res.status}: ${text.slice(0, 300)}`);
+      console.warn(`[aiValidator] Gemini HTTP ${res.status} — body: ${text.slice(0, 400)}`);
       return null;
     }
 
@@ -162,7 +195,10 @@ export async function validateTradeWithAi(
   timeoutMs: number = 6000,
 ): Promise<AiValidationResult | null> {
   const apiKey = getGeminiApiKey();
-  if (!apiKey) return null;
+  if (!apiKey) {
+    console.warn('[aiValidator] No key loaded — append #gk=KEY to the URL or run setGeminiKey(...)');
+    return null;
+  }
 
   const userPayload = {
     candidate: {
@@ -183,6 +219,8 @@ export async function validateTradeWithAi(
     session: { killZone: ctx.killZoneName, killZoneWeight: ctx.killZoneWeight },
     botState: {
       dailyPnlPct: ctx.dailyPnlPct,
+      recentWinRatePct: ctx.recentWinRatePct,
+      recentLossStreak: ctx.recentLossStreak,
       recentTrades: ctx.recentTrades.slice(0, 8),
     },
   };
@@ -227,4 +265,91 @@ export async function validateTradeWithAi(
   );
 
   return Promise.race([race, timeout]);
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Console helpers
+// ────────────────────────────────────────────────────────────────────────────
+if (typeof window !== 'undefined') {
+  (window as any).setGeminiKey = (key: string) => {
+    if (typeof key !== 'string' || key.trim().length === 0) {
+      console.log('%c❌ setGeminiKey: empty/invalid key', 'color:#FF3366;font-weight:bold');
+      return;
+    }
+    const v = key.trim();
+    let stored = false;
+
+    try { window.localStorage.setItem(LS_KEY_NAME, v); stored = true; }
+    catch (e) { console.warn('[setGeminiKey] localStorage blocked:', e); }
+
+    try { window.sessionStorage.setItem(SS_KEY_NAME, v); stored = true; }
+    catch (e) { console.warn('[setGeminiKey] sessionStorage blocked:', e); }
+
+    (window as any).__GEMINI_API_KEY__ = v;
+    stored = true;
+
+    if (stored) {
+      console.log('%c✅ Key stored — reloading in 1s to activate…', 'color:#00E676;font-weight:bold');
+      setTimeout(() => window.location.reload(), 1000);
+    } else {
+      console.log('%c⚠️ All storage blocked. Use the URL hash method:', 'color:#FFB300;font-weight:bold');
+      console.log('   Append "#gk=YOUR_KEY" to the preview URL, then reload.');
+    }
+  };
+
+  (window as any).clearGeminiKey = () => {
+    try { window.localStorage.removeItem(LS_KEY_NAME); } catch { /* ignore */ }
+    try { window.sessionStorage.removeItem(SS_KEY_NAME); } catch { /* ignore */ }
+    (window as any).__GEMINI_API_KEY__ = undefined;
+    console.log('%c🗑️ Key cleared from all storage', 'color:#FFB300;font-weight:bold');
+  };
+
+  (window as any).testGeminiKey = async () => {
+    const key = getGeminiApiKey();
+
+    if (!key) {
+      console.log('%c❌ No key loaded', 'color:#FF3366; font-weight:bold');
+      console.log('   → Run: setGeminiKey("AQ.Ab8RN6...")');
+      console.log('   → Or append #gk=YOUR_KEY to the URL and reload.');
+      return;
+    }
+
+    console.log(`%c🔑 Key loaded — first 10 chars: ${key.slice(0, 10)}...`, 'color:#00D8F6');
+
+    try {
+      const res = await fetch(
+        'https://generativelanguage.googleapis.com/v1beta/models',
+        { headers: { 'x-goog-api-key': key } },
+      );
+      const data = await res.json();
+
+      if (data?.error) {
+        console.log(`%c❌ Key rejected: ${data.error.message}`, 'color:#FF3366; font-weight:bold');
+        console.log('   HTTP status:', res.status);
+      } else if (Array.isArray(data?.models)) {
+        console.log(`%c✅ Key works — ${data.models.length} Gemini models available`, 'color:#00E676; font-weight:bold');
+        console.log(`   Validator will use model: ${GEMINI_MODEL}`);
+      } else {
+        console.log('⚠️ Unexpected response shape:', data);
+      }
+    } catch (err: any) {
+      console.log(`%c❌ Network error: ${err.message}`, 'color:#FF3366; font-weight:bold');
+    }
+  };
+
+  // Auto-pickup key from URL hash
+  try {
+    const m = window.location.hash.match(/(?:^|[#&])gk=([^&]+)/);
+    if (m && m[1]) {
+      const hashKey = decodeURIComponent(m[1]).trim();
+      if (hashKey) {
+        try { window.localStorage.setItem(LS_KEY_NAME, hashKey); } catch { /* ignore */ }
+        try { window.sessionStorage.setItem(SS_KEY_NAME, hashKey); } catch { /* ignore */ }
+        (window as any).__GEMINI_API_KEY__ = hashKey;
+        console.log('%c🔑 Key picked up from URL hash', 'color:#00E676;font-weight:bold');
+      }
+    }
+  } catch { /* ignore */ }
+
+  console.log('%c🧠 Gemini test ready — type `await window.testGeminiKey()`', 'color:#9D4EDD; font-style:italic');
 }

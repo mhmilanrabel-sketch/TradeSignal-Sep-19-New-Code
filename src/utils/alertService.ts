@@ -16,9 +16,6 @@ const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 // Low-level sender — plain text only, no parse_mode, always URL-encoded.
 // ────────────────────────────────────────────────────────────────────────────
 async function sendTelegram(text: string): Promise<boolean> {
-  // Guard: both values must be non-empty strings with no leftover placeholders.
-  // We do NOT compare against the literal 'PASTE_...' strings, because TS
-  // flags those comparisons as impossible once a real value is hard-coded.
   const tokenOk = typeof TELEGRAM_BOT_TOKEN === 'string' && TELEGRAM_BOT_TOKEN.trim().length > 0;
   const chatOk  = typeof TELEGRAM_CHAT_ID   === 'string' && TELEGRAM_CHAT_ID.trim().length   > 0;
 
@@ -142,6 +139,33 @@ export async function alertBotStopped(environment: string): Promise<boolean> {
   return sendTelegram(
     `⏸️ BOT STOPPED\n` +
     `Env: ${environment}\n` +
+    `Time: ${new Date().toUTCString()}`,
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// NEW — Killzone transition alerts
+//
+// Fires when the active killzone changes (enter a new zone, or exit all
+// zones). Driven by the watcher effect in App.tsx that polls
+// getActiveKillZoneInfo() every 30 seconds.
+// ═══════════════════════════════════════════════════════════════════════════
+export async function alertKillZoneChange(
+  event: 'ENTER' | 'EXIT',
+  zoneName: string,
+  zoneRange: string,
+  weight: number,
+  env: string,
+): Promise<boolean> {
+  const emoji = event === 'ENTER' ? '🟢' : '🔴';
+  const verb  = event === 'ENTER' ? 'ENTERED' : 'EXITED';
+
+  return sendTelegram(
+    `${emoji} KILLZONE ${verb}\n` +
+    `Zone: ${zoneName}\n` +
+    (zoneRange ? `Range: ${zoneRange}\n` : '') +
+    `Weight: ${weight}\n` +
+    `Env: ${env.toUpperCase()}\n` +
     `Time: ${new Date().toUTCString()}`,
   );
 }

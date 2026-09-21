@@ -73,7 +73,7 @@ export interface ConfluenceScore {
 }
 
 // Minimum ATR as % of price. Below this → chop, reject trade entirely.
-const MIN_ATR_PCT = 0.0025;   // 0.25% per 5m bar
+const MIN_ATR_PCT = 0.0030;   // ← CHANGED: was 0.0025 (0.25%) — 0.30% filters chop better
 const MAX_ATR_PCT = 0.02;     // 2.0% per 5m bar — above this = violent, reject
 
 export function scoreConfluence(candles: CandleData[]): ConfluenceScore {
@@ -192,7 +192,7 @@ export function isInKillZone(): { ok: boolean; name: string; weight: number } {
     const inZone = s <= e ? mins >= s && mins < e : mins >= s || mins < e;
     if (inZone) return { ok: true, name, weight: z.weight };
   }
-  return { ok: false, name: 'off-zone', weight: 0.5 };
+  return { ok: false, name: 'off-zone', weight: 0 };
 }
 
 // ----------------------------------------------------------------------------
@@ -220,7 +220,7 @@ export function buildRiskLevels(
 }
 
 // ----------------------------------------------------------------------------
-// Position sizing — respects risk AND available margin
+// Position sizing
 // ----------------------------------------------------------------------------
 
 const STEP_MAP: Record<string, number> = {
@@ -237,7 +237,7 @@ const STEP_MAP: Record<string, number> = {
 };
 
 const DEFAULT_LEVERAGE = 10;
-const MARGIN_SAFETY_FACTOR = 0.85;   // use only 85% of available margin
+const MARGIN_SAFETY_FACTOR = 0.85;
 
 export function positionSize(
   symbol: string,
@@ -250,19 +250,11 @@ export function positionSize(
   if (slDist <= 0 || accountBalance <= 0 || entry <= 0) return 0;
 
   const step = STEP_MAP[symbol] ?? 0.01;
-
-  // ---- 1) Quantity from risk budget ----
   const riskUsd = accountBalance * (riskPct / 100);
   const riskQty = riskUsd / slDist;
-
-  // ---- 2) Quantity from margin cap ----
-  // Required margin = (qty * price) / leverage. Cap at 85% of balance.
   const maxNotionalUsd = accountBalance * leverage * MARGIN_SAFETY_FACTOR;
   const marginQty = maxNotionalUsd / entry;
-
-  // Take the smaller of the two
   const rawQty = Math.min(riskQty, marginQty);
-
   const qty = Math.floor(rawQty / step) * step;
-  return Math.max(Number(qty.toFixed(8)), 0);   // don't force minimum step
+  return Math.max(Number(qty.toFixed(8)), 0);
 }
