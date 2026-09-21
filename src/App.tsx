@@ -15,6 +15,12 @@ import {
 } from './utils/signalEngine';
 import { getCachedCandles } from './utils/marketData';
 import {
+  validateTradeWithAi,
+  isAiValidatorConfigured,
+  type AiTradeContext,
+  type AiRecentTrade,
+} from './utils/aiTradeValidator';
+import {
   alertTest,
   alertTradeOpened,
   alertTradeClosed,
@@ -27,7 +33,7 @@ import {
   Activity, Shield, Flame, XCircle, ArrowUpRight, ArrowDownRight,
   RotateCcw, Bot, BrainCircuit, Play, Pause, Sparkles, Gauge, RefreshCw,
   Clock, GraduationCap, Key, CheckCircle2, ShieldAlert, AlertTriangle,
-  Globe, Sliders, Zap, Target, Copy, Check, Skull, Lock,
+  Globe, Sliders, Zap, Target, Copy, Check, Skull, Lock, Brain,
 } from 'lucide-react';
 
 // ============================================================================
@@ -54,12 +60,12 @@ const DEFAULT_API_SECRET = '';
 const EC2_PROXY_HOST = 'https://13-60-238-187.nip.io';
 const EC2_PROXY_SECRET = 'WorldWar2026';
 
-// ── ✅ CHANGE 3: Raised from 55 → 65 for higher-quality entries (fewer SL hits)
-const MIN_CONFLUENCE_SCORE = 65;
+// ── CHANGE 1: Raised 65 → 70 for higher-quality entries
+const MIN_CONFLUENCE_SCORE = 70;
 const MIN_KILLZONE_WEIGHT = 0.3;
 const SKIP_KILLZONE_DEFAULT = true;
 
-// 🛡️ SAFETY CONSTANTS — UNCHANGED
+// SAFETY CONSTANTS
 const MAX_ACTIVE_TRADES = 6;
 const MAX_SAME_DIRECTION = 3;
 const MAX_MARGIN_USE_PCT = 40;
@@ -69,7 +75,7 @@ const BALANCE_REFRESH_MS = 20_000;
 const COOLDOWN_AFTER_SL_MS = 15 * 60_000;
 const MAX_CONSECUTIVE_FAILURES = 3;
 
-// ── ✅ CHANGE: 15-Minute candle-close gate. Only fire within the last 30s of a 15m bar.
+// Candle-close gate window
 const CANDLE_CLOSE_WINDOW_SEC = 30;
 
 const SCAN_WHITELIST = new Set<string>([
@@ -152,8 +158,7 @@ const INITIAL_MARKET_ASSETS: MarketAsset[] = [
   { symbol: 'DOT/USDT', name: 'Polkadot Spot', price: 8.9, change24h: -0.3, high24h: 9.3, low24h: 8.6, volume24h: '14.2K', assetClass: 'Crypto' },
 ];
 
-// ── ✅ CHANGE 2: off-killzone weight is now 0 (was 1.0). The gate now actually
-//    functions when Test Mode = OFF.
+// Off-killzone weight is 0 so the gate functions when Test Mode = OFF.
 const getActiveKillZoneInfo = () => {
   const now = new Date();
   const currentTotalMins = now.getUTCHours() * 60 + now.getUTCMinutes();
@@ -176,8 +181,6 @@ const getActiveKillZoneInfo = () => {
   return { name: 'OFF-KILLZONE', weight: 0, range: 'STANDARD BIAS', isActive: false };
 };
 
-// ── ✅ CHANGE 1 helper: returns true only when we are inside the last N seconds
-//    of a 15-minute UTC candle boundary (00, 15, 30, 45 minutes).
 const isIn15mCandleCloseWindow = (windowSec: number = CANDLE_CLOSE_WINDOW_SEC): boolean => {
   const now = new Date();
   const minsIntoBar = now.getUTCMinutes() % 15;
@@ -250,6 +253,16 @@ export const App: React.FC = () => {
   const [testAlertMessage, setTestAlertMessage] = useState<string | null>(null);
 
   const [skipKillZone, setSkipKillZone] = useState<boolean>(SKIP_KILLZONE_DEFAULT);
+
+  // CHANGE 2: AI Trade Validator toggle (persisted)
+  const [aiValidatorEnabled, setAiValidatorEnabled] = useState<boolean>(() => {
+    try { return localStorage.getItem('tradesignal_ai_validator') === '1'; }
+    catch { return false; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem('tradesignal_ai_validator', aiValidatorEnabled ? '1' : '0'); }
+    catch { /* ignore */ }
+  }, [aiValidatorEnabled]);
 
   const [killSwitchOn, setKillSwitchOn] = useState<boolean>(() =>
     localStorage.getItem('tradesignal_kill_switch') === '1'
@@ -554,40 +567,60 @@ export const App: React.FC = () => {
   };
 
   // ────────────────────────────────────────────────────────────────────────────
-  // cancelAllAlgoOrders — removes stale SL/TP orders for a symbol
+  // CHANGE 3: cancelAllAlgoOrders — HARDENED for demo's async propagation.
   // ────────────────────────────────────────────────────────────────────────────
   const cancelAllAlgoOrders = async (sym: string): Promise<boolean> => {
     if (!apiSettings.apiKey || !apiSettings.apiSecret) return false;
     const baseUrl = getBaseUrl(apiSettings.environment, true);
-    const qs = `symbol=${sym}&timestamp=${Date.now()}&recvWindow=10000`;
-    let signature: string;
-    try {
-      signature = await generateSignature(qs, apiSettings.apiSecret);
-    } catch { return false; }
-    const url = getCorsProxyUrl(`${baseUrl}/fapi/v1/algoOpenOrders?${qs}&signature=${signature}`);
-    try {
-      const res = await fetch(url, {
-        method: 'DELETE',
-        headers: { 'X-MBX-APIKEY': apiSettings.apiKey, 'Content-Type': 'application/json' },
-      });
-      const text = await res.text();
-      if (!res.ok) {
-        console.warn(`[cancelAlgo] HTTP ${res.status} body: ${text.slice(0, 200)}`);
-        return false;
-      }
+    const headers = { 'X-MBX-APIKEY': apiSettings.apiKey, 'Content-Type': 'application/json' };
+
+    const signAndCall = async (
+      method: 'GET' | 'DELETE',
+      path: string,
+      params: Record<string, string>,
+    ): Promise<any | null> => {
+      const qs = Object.entries({ ...params, timestamp: Date.now().toString(), recvWindow: '10000' })
+        .map(([k, v]) => `${k}=${encodeURIComponent(v)}`)
+        .join('&');
+      let sig: string;
+      try { sig = await generateSignature(qs, apiSettings.apiSecret); }
+      catch { return null; }
+      const url = getCorsProxyUrl(`${baseUrl}${path}?${qs}&signature=${sig}`);
       try {
-        const data = JSON.parse(text);
-        return data?.code === 200 || data?.code === '200';
-      } catch { return true; }
-    } catch (err: any) {
-      console.warn(`[cancelAlgo] network err: ${err.message}`);
-      return false;
+        const res = await fetch(url, { method, headers });
+        const text = await res.text();
+        if (!res.ok) {
+          console.warn(`[cancelAlgo] ${method} ${path} HTTP ${res.status}: ${text.slice(0, 200)}`);
+          return null;
+        }
+        try { return JSON.parse(text); } catch { return true; }
+      } catch (err: any) {
+        console.warn(`[cancelAlgo] ${method} ${path} network err: ${err.message}`);
+        return null;
+      }
+    };
+
+    // Step 1 — bulk cancel (fast path)
+    await signAndCall('DELETE', '/fapi/v1/algoOpenOrders', { symbol: sym });
+
+    // Step 2 — list any leftover open orders and cancel individually
+    const open = await signAndCall('GET', '/fapi/v1/openOrders', { symbol: sym });
+    if (Array.isArray(open) && open.length > 0) {
+      console.warn(`[cancelAlgo] ${sym}: ${open.length} leftover order(s) still alive — cancelling individually`);
+      for (const o of open) {
+        if (!o?.orderId) continue;
+        await signAndCall('DELETE', '/fapi/v1/order', {
+          symbol: sym,
+          orderId: String(o.orderId),
+        });
+      }
     }
+
+    // Step 3 — let the exchange propagate the cancels before the next POST
+    await new Promise((r) => setTimeout(r, 400));
+    return true;
   };
 
-  // ────────────────────────────────────────────────────────────────────────────
-  // executeBinanceOrder — standard MARKET order (entry + emergency close)
-  // ────────────────────────────────────────────────────────────────────────────
   const executeBinanceOrder = async (
     symbol: string, side: 'BUY' | 'SELL', quantity: number,
     orderType: 'MARKET' | 'LIMIT' = 'MARKET', price?: number, reduceOnly: boolean = false,
@@ -663,7 +696,8 @@ export const App: React.FC = () => {
   };
 
   // ────────────────────────────────────────────────────────────────────────────
-  // executeBinanceOrderWithStops — entry MARKET + native SL/TP via ALGO API
+  // CHANGE 4: executeBinanceOrderWithStops — SL/TP wrapped in sendAlgoWithRetry
+  //   which auto-retries on -4130 (demo's async cancel propagation).
   // ────────────────────────────────────────────────────────────────────────────
   const executeBinanceOrderWithStops = async (
     symbol: string, side: 'BUY' | 'SELL', quantity: number,
@@ -744,6 +778,19 @@ export const App: React.FC = () => {
       } catch (err: any) { return { err: err.message }; }
     };
 
+    // ✅ CHANGE 4: retry wrapper for -4130
+    const sendAlgoWithRetry = async (params: Record<string, string>) => {
+      let first = await sendAlgoOrder(params);
+      if (first?.algoId) return first;
+      if (String(first?.code) === '-4130') {
+        console.warn(`[algoOrder] -4130 hit, re-running hard cleanup on ${sym} then retrying once`);
+        await cancelAllAlgoOrders(sym);
+        await new Promise((r) => setTimeout(r, 700));
+        first = await sendAlgoOrder(params);
+      }
+      return first;
+    };
+
     // ── 1) ENTRY MARKET ──
     const entryParams: Record<string, string> = {
       symbol: sym, side, type: 'MARKET', quantity: roundedQty.toString(),
@@ -767,14 +814,12 @@ export const App: React.FC = () => {
     const fillPrice = parseFloat(entry.avgPrice || entry.price || '0') || undefined;
     setConnectionLog(`ORDER PLACED: ${side} ${roundedQty} ${symbol} | ID: ${entry.orderId}${fillPrice ? ` | Fill: $${fillPrice}` : ''}`);
 
-    // ── 2) SPOT — no native SL/TP ──
     if (!isFutures) {
       setConnectionLog(`ℹ️ SPOT mode: app-managed SL/TP only.`);
       await refreshAccountSnapshot();
       return { success: true, orderId: String(entry.orderId), fillPrice };
     }
 
-    // ── 3) Cancel stale algo orders before attaching new SL/TP ──
     setConnectionLog(`🧹 Cleaning stale algo orders for ${symbol}...`);
     await cancelAllAlgoOrders(sym);
 
@@ -783,8 +828,7 @@ export const App: React.FC = () => {
     const slRounded = roundToStep(stopLoss, tick);
     const tpRounded = roundToStep(takeProfit, tick);
 
-    // ── 4) NATIVE SL via ALGO API ──
-    const slResult = await sendAlgoOrder({
+    const slResult = await sendAlgoWithRetry({
       symbol: sym,
       side: closeSide,
       type: 'STOP_MARKET',
@@ -794,8 +838,7 @@ export const App: React.FC = () => {
       workingType: 'MARK_PRICE',
     });
 
-    // ── 5) NATIVE TP via ALGO API ──
-    const tpResult = await sendAlgoOrder({
+    const tpResult = await sendAlgoWithRetry({
       symbol: sym,
       side: closeSide,
       type: 'TAKE_PROFIT_MARKET',
@@ -805,7 +848,6 @@ export const App: React.FC = () => {
       workingType: 'MARK_PRICE',
     });
 
-    // ── 6) Verify — response field is algoId ──
     const slOk = Boolean(slResult.algoId);
     const tpOk = Boolean(tpResult.algoId);
 
@@ -861,7 +903,6 @@ export const App: React.FC = () => {
         try {
           const payload = JSON.parse(event.data);
 
-          // ── ALGO_UPDATE (SL/TP fills) ──
           if (payload.e === 'ALGO_UPDATE') {
             const o = payload.o ?? {};
             const rawSymbol = o.s ?? o.symbol;
@@ -914,7 +955,6 @@ export const App: React.FC = () => {
             return;
           }
 
-          // ── ORDER_TRADE_UPDATE (entry MARKET fill) ──
           if (payload.e !== 'ORDER_TRADE_UPDATE') return;
           const o = payload.o ?? {};
           const rawSymbol = o.s ?? o.symbol;
@@ -1207,40 +1247,123 @@ ${items.join('\n\n')}
 
     const newPositions: TradeSignal[] = [];
     let longsQueued = 0, shortsQueued = 0;
+    const aiMultiplierMap: Record<string, number> = {};
 
     for (const { asset, candles, error } of candleResults) {
       if (newPositions.length >= slots) break;
       if (error || candles.length < 30) continue;
 
       const confluence = scoreConfluence(candles);
-      console.log(`[SCAN] ${asset.symbol}: score=${confluence.total.toFixed(0)} dir=${confluence.direction} | ${confluence.reasons.join(', ')}`);
+      console.log(`[SCAN] ${asset.symbol}: 5m score=${confluence.total.toFixed(0)} dir=${confluence.direction} | ${confluence.reasons.join(', ')}`);
 
+      // Gate A — 5m must reach threshold
       if (confluence.total < MIN_CONFLUENCE_SCORE || confluence.direction === 'NONE') continue;
 
-      // ── ✅ CHANGE 4: HTF Alignment Gate — reject counter-trend scalps.
-      //    Reuses the reasons array from scoreConfluence (no new API calls).
-      const hasBullStack = confluence.reasons.some((r) => /EMA stack bullish/i.test(r));
-      const hasBearStack = confluence.reasons.some((r) => /EMA stack bearish/i.test(r));
-      if (confluence.direction === 'LONG' && hasBearStack) {
-        console.log(`[SCAN] ${asset.symbol}: ❌ rejected — LONG against bearish EMA stack`);
+      // CHANGE 5: Gate B — 15m trend must AGREE with 5m direction
+      const { candles: candles15m } = await getRealCandles(asset.symbol, '15m', 60);
+      if (candles15m.length < 30) {
+        console.log(`[SCAN] ${asset.symbol}: ⏸ 15m candles insufficient (${candles15m.length})`);
         continue;
       }
-      if (confluence.direction === 'SHORT' && hasBullStack) {
-        console.log(`[SCAN] ${asset.symbol}: ❌ rejected — SHORT against bullish EMA stack`);
+      const trend15m = scoreConfluence(candles15m);
+      console.log(`[SCAN] ${asset.symbol}: 15m score=${trend15m.total.toFixed(0)} dir=${trend15m.direction}`);
+      if (confluence.direction === 'LONG' && trend15m.direction !== 'LONG') {
+        console.log(`[SCAN] ${asset.symbol}: ❌ rejected — 5m LONG but 15m is ${trend15m.direction}`);
+        continue;
+      }
+      if (confluence.direction === 'SHORT' && trend15m.direction !== 'SHORT') {
+        console.log(`[SCAN] ${asset.symbol}: ❌ rejected — 5m SHORT but 15m is ${trend15m.direction}`);
         continue;
       }
 
+      // CHANGE 5: Gate C — 1h trend must NOT be actively opposed (NEUTRAL OK)
+      const { candles: candles1h } = await getRealCandles(asset.symbol, '1h', 60);
+      let trend1h = { total: 0, direction: 'NONE' as 'LONG' | 'SHORT' | 'NONE', reasons: [] as string[] };
+      if (candles1h.length >= 30) {
+        trend1h = scoreConfluence(candles1h);
+        console.log(`[SCAN] ${asset.symbol}: 1h score=${trend1h.total.toFixed(0)} dir=${trend1h.direction}`);
+        if (confluence.direction === 'LONG' && trend1h.direction === 'SHORT') {
+          console.log(`[SCAN] ${asset.symbol}: ❌ rejected — 5m LONG against 1h SHORT`);
+          continue;
+        }
+        if (confluence.direction === 'SHORT' && trend1h.direction === 'LONG') {
+          console.log(`[SCAN] ${asset.symbol}: ❌ rejected — 5m SHORT against 1h LONG`);
+          continue;
+        }
+      }
+
+      // Gate D — direction slot availability
       if (confluence.direction === 'LONG' && longsQueued >= longSlots) continue;
       if (confluence.direction === 'SHORT' && shortsQueued >= shortSlots) continue;
+
+      // CHANGE 5: Gate E — optional AI second opinion for BORDERLINE setups
+      let aiMultiplier = 1.0;
+      let aiReasoning = '';
+      if (
+        aiValidatorEnabled &&
+        confluence.total >= MIN_CONFLUENCE_SCORE &&
+        confluence.total < 85
+      ) {
+        const recentTrades: AiRecentTrade[] = signals
+          .filter((s) => s.status === 'CLOSED')
+          .slice(0, 8)
+          .map((s) => ({
+            symbol: s.symbol,
+            direction: s.direction,
+            outcome: (s as any).outcome || 'CLOSED',
+            pnlPct: Number((s.pnlPercentage ?? 0).toFixed(2)),
+          }));
+
+        const tmpRisk = buildRiskLevels(confluence.direction, asset.price, confluence.indicators.atr);
+        const aiCtx: AiTradeContext = {
+          symbol: asset.symbol,
+          direction: confluence.direction,
+          entryPrice: asset.price,
+          stopLoss: tmpRisk.stopLoss,
+          takeProfit: tmpRisk.takeProfit1,
+          score5m: Math.round(confluence.total),
+          score15m: Math.round(trend15m.total),
+          score1h: Math.round(trend1h.total),
+          direction5m: confluence.direction,
+          direction15m: trend15m.direction,
+          direction1h: trend1h.direction,
+          reasons5m: confluence.reasons.slice(0, 8),
+          reasons15m: trend15m.reasons.slice(0, 8),
+          reasons1h: trend1h.reasons.slice(0, 8),
+          atrPct: confluence.indicators.atrPct,
+          dailyPnlPct: dailyPnlRef.current.pnl,
+          recentTrades,
+          killZoneName: zone.name,
+          killZoneWeight: zone.weight,
+        };
+
+        console.log(`[AI] ${asset.symbol}: requesting second opinion (score ${Math.round(confluence.total)})`);
+        const aiResult = await validateTradeWithAi(aiCtx, 6000);
+
+        if (aiResult) {
+          console.log(
+            `[AI] ${asset.symbol}: ${aiResult.verdict} (${aiResult.confidence}%) — ${aiResult.reason}`,
+          );
+          if (aiResult.verdict === 'REJECT') {
+            console.log(`[AI] ${asset.symbol}: ❌ AI rejected the trade`);
+            continue;
+          }
+          aiMultiplier = aiResult.positionSizeMultiplier;
+          aiReasoning = ` | AI: ${aiResult.verdict} (${aiResult.confidence}%) — ${aiResult.reason}`;
+        } else {
+          console.log(`[AI] ${asset.symbol}: no verdict (unavailable or timeout) — proceeding on rules only`);
+        }
+      }
 
       const entry = asset.price;
       const { stopLoss, takeProfit1, takeProfit2, slDist } =
         buildRiskLevels(confluence.direction, entry, confluence.indicators.atr);
       const isLong = confluence.direction === 'LONG';
       const ts = Date.now();
+      const posId = `EXEC-${asset.symbol.replace('/', '')}-${isLong ? 'L' : 'S'}-${ts}`;
 
       newPositions.push({
-        id: `EXEC-${asset.symbol.replace('/', '')}-${isLong ? 'L' : 'S'}-${ts}`,
+        id: posId,
         symbol: asset.symbol, name: asset.name, assetClass: 'Crypto',
         direction: isLong ? 'BUY (LONG)' : 'SELL (SHORT)',
         entryPrice: entry, currentPrice: entry, targetPrice: takeProfit1,
@@ -1249,11 +1372,13 @@ ${items.join('\n\n')}
         riskRewardRatio: Number((Math.abs(takeProfit1 - entry) / slDist).toFixed(2)),
         pnlPercentage: 0,
         chartPattern: 'Multi-Confluence ATR Scalp (REAL DATA)',
-        reasoning: `[${botConfig.agent_config.bot_id}] Score ${Math.round(confluence.total)}/100 - ` +
-          confluence.reasons.join(' - ') + ` | Zone: ${zone.name} (w=${zone.weight})`,
+        reasoning: `[${botConfig.agent_config.bot_id}] 5m:${Math.round(confluence.total)} 15m:${Math.round(trend15m.total)} 1h:${Math.round(trend1h.total)} - ` +
+          confluence.reasons.join(' - ') + ` | Zone: ${zone.name} (w=${zone.weight})` + aiReasoning,
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
         startTime: ts,
       } as TradeSignal & { startTime?: number });
+
+      aiMultiplierMap[posId] = aiMultiplier;
 
       if (isLong) longsQueued++; else shortsQueued++;
       busySymbols.add(asset.symbol);
@@ -1279,8 +1404,13 @@ ${items.join('\n\n')}
       }
 
       const dist = Math.abs(pos.entryPrice - pos.stopLoss);
-      const qty = positionSize(pos.symbol, pos.entryPrice, dist, liveSnapshot.availableBalance);
+      const baseQty = positionSize(pos.symbol, pos.entryPrice, dist, liveSnapshot.availableBalance);
+      const multiplier = aiMultiplierMap[pos.id] ?? 1.0;
+      const qty = Number((baseQty * multiplier).toFixed(8));
       if (qty <= 0) continue;
+      if (multiplier < 1.0) {
+        setConnectionLog(`⚖️ ${pos.symbol} position halved by AI (${multiplier}x)`);
+      }
 
       const leverage = botConfig.binance_config.leverage || 1;
       const notional = qty * pos.entryPrice;
@@ -1361,14 +1491,11 @@ ${items.join('\n\n')}
     });
   }, [signals, apiSettings.apiKey, apiSettings.apiSecret]);
 
-  // ── ✅ CHANGE 1: Auto-scan now only fires within the last 30 seconds of a
-  //    15-minute UTC candle (00, 15, 30, 45 min). This matches the netlify
-  //    app's TradeCountdownRule and drops entry count ~60×.
   useEffect(() => {
     if (!isAutoPilotActive) return;
     const backgroundInterval = setInterval(() => {
       if (!isScanningRef.current && assetsRef.current.length > 0 && !killSwitchRef.current) {
-        if (!isIn15mCandleCloseWindow()) return;   // ← gate
+        if (!isIn15mCandleCloseWindow()) return;
         scanFnRef.current();
       }
     }, 15000);
@@ -1619,9 +1746,15 @@ ${items.join('\n\n')}
                     <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-orange-500/20 text-orange-300 border border-orange-500/30">
                       MARGIN ≤ {MAX_MARGIN_USE_PCT}%
                     </span>
+                    {aiValidatorEnabled && (
+                      <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-purple-500/20 text-purple-300 border border-purple-500/30 flex items-center gap-1">
+                        <Brain className="w-3 h-3" />
+                        AI VALIDATOR
+                      </span>
+                    )}
                   </div>
                   <p className="text-[11px] text-slate-400 mt-0.5">
-                    Confluence ≥ {MIN_CONFLUENCE_SCORE} · Real Binance Klines · ATR-scaled SL/TP · R:R 1:{botConfig.risk_engine.min_reward_risk_ratio}
+                    Confluence ≥ {MIN_CONFLUENCE_SCORE} · 15m/1h trend gates · Real Binance Klines · ATR-scaled SL/TP · R:R 1:{botConfig.risk_engine.min_reward_risk_ratio}
                   </p>
                 </div>
               </div>
@@ -1874,6 +2007,28 @@ ${items.join('\n\n')}
                 </button>
               </div>
 
+              <div className="p-3 bg-slate-950 rounded-xl border border-purple-500/30 flex items-center justify-between">
+                <div className="pr-2">
+                  <span className="text-xs font-bold text-white block flex items-center gap-1.5">
+                    <Brain className="w-3.5 h-3.5 text-purple-400" />
+                    AI Trade Validator (Gemini)
+                  </span>
+                  <span className="text-[11px] text-slate-400">
+                    Borderline setups (score 70–84) get a second opinion. Requires <code className="text-purple-300">VITE_GEMINI_API_KEY</code> in <code>.env.local</code>.
+                  </span>
+                </div>
+                <button
+                  onClick={() => setAiValidatorEnabled((v) => !v)}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-bold font-mono border transition-colors cursor-pointer ${
+                    aiValidatorEnabled
+                      ? 'bg-purple-500/20 text-purple-300 border-purple-500/40'
+                      : 'bg-slate-900 text-slate-400 border-slate-800'
+                  }`}
+                >
+                  {aiValidatorEnabled ? 'ON' : 'OFF'}
+                </button>
+              </div>
+
               <div className="p-3 bg-slate-950 rounded-xl border border-slate-800 space-y-2">
                 <span className="text-xs font-bold text-white block">Trading Environment</span>
                 <div className="grid grid-cols-3 gap-2">
@@ -1964,7 +2119,7 @@ ${items.join('\n\n')}
               <h4 className="text-xs font-bold text-white mb-2">🛡️ Safety Layers Active</h4>
               <div className="text-[11px] text-slate-400 space-y-1 font-mono">
                 <div>✅ Algo SL/TP via /fapi/v1/algoOrder (algoType=CONDITIONAL)</div>
-                <div>✅ Stale algo orders cancelled before every new attach</div>
+                <div>✅ Stale algo orders cancelled before every new attach (retry on -4130)</div>
                 <div>✅ Hard block if balance unknown or stale (&gt;60s)</div>
                 <div>✅ Direction cap: max {MAX_SAME_DIRECTION} longs / {MAX_SAME_DIRECTION} shorts</div>
                 <div>✅ Free-margin guard: ≤{MAX_MARGIN_USE_PCT}% of available per order</div>
@@ -1972,6 +2127,9 @@ ${items.join('\n\n')}
                 <div>✅ Kill switch tripped by -{MAX_DAILY_LOSS_PCT}% daily loss, {MAX_CONSECUTIVE_FAILURES} failures, or manual</div>
                 <div>✅ Balance re-read between every order in a batch</div>
                 <div>✅ Quantity floored to LOT_SIZE, triggerPrice to PRICE_FILTER</div>
+                <div>✅ 15m + 1h trend confirmation gates before every entry</div>
+                <div>✅ 15-minute candle-close window (last 30s only)</div>
+                <div>{aiValidatorEnabled ? '✅ AI Trade Validator ON (Gemini second opinion on borderline setups)' : '⏸ AI Trade Validator OFF'}</div>
               </div>
             </div>
 

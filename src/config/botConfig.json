@@ -9,13 +9,24 @@
   "binance_config": {
     "base_ws_url": "wss://stream.binance.com:9443/ws",
     "base_futures_ws_url": "wss://fstream.binance.com/ws/",
-    "symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT", "ADAUSDT"],
+    "symbols": [
+      "BTCUSDT",
+      "ETHUSDT",
+      "SOLUSDT",
+      "BNBUSDT",
+      "XRPUSDT",
+      "ADAUSDT",
+      "DOGEUSDT",
+      "AVAXUSDT",
+      "LINKUSDT",
+      "DOTUSDT"
+    ],
     "execution_mode": "FUTURES",
     "leverage": 10,
     "margin_type": "ISOLATED"
   },
   "kill_zones_utc": {
-    "asian_session": { "start": "00:00", "end": "08:00", "weight": 0.7 },
+    "asian_session": { "start": "00:00", "end": "07:00", "weight": 0.2 },
     "london_open": { "start": "07:00", "end": "10:00", "weight": 1.2 },
     "new_york_open": { "start": "13:00", "end": "16:00", "weight": 1.5 },
     "london_close": { "start": "16:00", "end": "18:00", "weight": 1.0 }
