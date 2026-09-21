@@ -82,9 +82,9 @@ const FUNDING_CACHE_TTL_MS = 10 * 60_000;
 
 const USER_STREAM_KEEPALIVE_MS = 25 * 60_000; // 25 min (safe margin below Binance's 30-min limit)
 
-// ✏️ NEW — max acceptable price drift between scoring and execution.
-//    Was hard-coded 0.4%, now 1.0% to account for the scan pipeline taking
-//    30-60s (AI timeouts + 3 candle fetches + funding per symbol).
+// Max acceptable price drift between scoring and execution.
+// Was hard-coded 0.4%, now 1.0% to account for the scan pipeline taking
+// 30-60s (AI timeouts + 3 candle fetches + funding per symbol).
 const MAX_ENTRY_DRIFT_PCT = 0.010;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -164,6 +164,15 @@ interface AccountSnapshot {
   marginBalance: number;
   unrealizedPnl: number;
   updatedAt: number;
+}
+
+interface OrphanPosition {
+  symbol: string;
+  positionAmt: number;
+  entryPrice: number;
+  unRealizedProfit: number;
+  isolatedMargin: number;
+  marginType: string;
 }
 
 const INITIAL_MARKET_ASSETS: MarketAsset[] = [
@@ -288,6 +297,10 @@ export const App: React.FC = () => {
   );
 
   const [accountSnapshot, setAccountSnapshot] = useState<AccountSnapshot | null>(null);
+
+  // ✏️ NEW — Orphan positions detected on Binance at startup
+  const [orphanPositions, setOrphanPositions] = useState<OrphanPosition[]>([]);
+  const [orphanBannerDismissed, setOrphanBannerDismissed] = useState<boolean>(false);
 
   const [apiSettings, setApiSettings] = useState<BinanceApiSettings>(() => {
     const saved = localStorage.getItem('tradesignal_binance_api_config');
@@ -493,6 +506,83 @@ export const App: React.FC = () => {
       const row = data.find((p: any) => p.symbol === binanceSym);
       return row ? Math.abs(parseFloat(row.positionAmt || '0')) : 0;
     } catch { return 0; }
+  };
+
+  // ✏️ NEW — Returns ALL open positions from Binance, for orphan detection.
+  const getAllOpenPositions = async (): Promise<OrphanPosition[]> => {
+    if (!apiSettings.apiKey || !apiSettings.apiSecret || !apiSettings.enableFutures) return [];
+    const baseUrl = getBaseUrl(apiSettings.environment, true);
+    const qs = `timestamp=${Date.now()}&recvWindow=10000`;
+    let sig: string;
+    try { sig = await generateSignature(qs, apiSettings.apiSecret); }
+    catch { return []; }
+    const url = getCorsProxyUrl(`${baseUrl}/fapi/v2/positionRisk?${qs}&signature=${sig}`);
+    try {
+      const res = await fetch(url, {
+        headers: { 'X-MBX-APIKEY': apiSettings.apiKey, 'Content-Type': 'application/json' },
+      });
+      if (!res.ok) return [];
+      const data = await res.json();
+      if (!Array.isArray(data)) return [];
+      return data
+        .filter((p: any) => Math.abs(parseFloat(p.positionAmt || '0')) > 0)
+        .map((p: any) => ({
+          symbol: p.symbol,
+          positionAmt: parseFloat(p.positionAmt),
+          entryPrice: parseFloat(p.entryPrice),
+          unRealizedProfit: parseFloat(p.unRealizedProfit),
+          isolatedMargin: parseFloat(p.isolatedMargin || '0'),
+          marginType: String(p.marginType || 'unknown'),
+        }));
+    } catch { return []; }
+  };
+
+  // ✏️ NEW — Closes a single orphan position via reduceOnly MARKET order.
+  const closeOrphanPosition = async (orphan: OrphanPosition): Promise<{ success: boolean; orderId?: string; error?: string }> => {
+    const isFutures = apiSettings.enableFutures;
+    const baseUrl = getBaseUrl(apiSettings.environment, isFutures);
+    const closeSide: 'BUY' | 'SELL' = orphan.positionAmt > 0 ? 'SELL' : 'BUY';
+    const sym = orphan.symbol.toUpperCase();
+
+    const info = exchangeInfoRef.current[sym];
+    const step = info?.stepSize ?? 0.001;
+    const qty = roundToStep(Math.abs(orphan.positionAmt), step);
+
+    const params: Record<string, string> = {
+      symbol: sym, side: closeSide, type: 'MARKET',
+      quantity: qty.toString(),
+      timestamp: Date.now().toString(), recvWindow: '10000',
+    };
+    if (isFutures) {
+      params.positionSide = 'BOTH';
+      params.reduceOnly = 'true';
+    }
+
+    const queryString = Object.entries(params).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&');
+    let signature: string;
+    try { signature = await generateSignature(queryString, apiSettings.apiSecret); }
+    catch (err: any) { return { success: false, error: `Signature error: ${err.message}` }; }
+
+    const endpoint = isFutures ? '/fapi/v1/order' : '/api/v3/order';
+    const targetUrl = `${baseUrl}${endpoint}?${queryString}&signature=${signature}`;
+    const proxiedUrl = getCorsProxyUrl(targetUrl);
+
+    try {
+      const res = await fetch(proxiedUrl, {
+        method: 'POST',
+        headers: { 'X-MBX-APIKEY': apiSettings.apiKey, 'Content-Type': 'application/json' },
+      });
+      const rawText = await res.text();
+      if (rawText.trim().startsWith('<')) {
+        return { success: false, error: 'Proxy returned HTML (geo-block)' };
+      }
+      let data: any;
+      try { data = JSON.parse(rawText); } catch { return { success: false, error: 'Non-JSON from proxy' }; }
+      if (data?.orderId) return { success: true, orderId: String(data.orderId) };
+      return { success: false, error: data?.msg ? `[${data.code}] ${data.msg}` : 'Unknown error' };
+    } catch (err: any) {
+      return { success: false, error: err.message };
+    }
   };
 
   const getFundingRate = async (binanceSym: string): Promise<number> => {
@@ -1443,7 +1533,7 @@ ${items.join('\n\n')}
     const today = new Date().toISOString().slice(0, 10);
     if (dailyPnlRef.current.day !== today) dailyPnlRef.current = { day: today, pnl: 0 };
 
-    // ✏️ FIXED — only pause on real drawdown (negative), never on winning days.
+    // Only pause on real drawdown (negative), never on winning days.
     if (dailyPnlRef.current.pnl <= -botConfig.risk_engine.max_daily_drawdown_percent) {
       setConnectionLog(
         `🛑 Daily drawdown limit reached (${dailyPnlRef.current.pnl.toFixed(2)}% ≤ -${botConfig.risk_engine.max_daily_drawdown_percent}%) — paused.`
@@ -1507,8 +1597,7 @@ ${items.join('\n\n')}
         return Date.now() - lastSL >= COOLDOWN_AFTER_SL_MS;
       });
 
-    // ✏️ NEW — surface AI-unavailable to the UI once at scan start so the
-    //         user sees a clear banner instead of only a console warning.
+    // Surface AI-unavailable to the UI once at scan start.
     if (aiValidatorEnabled && !isAiValidatorConfigured()) {
       setConnectionLog(
         '⚠️ AI Validator is ON but no Gemini key is loaded — falling back to rules-only. ' +
@@ -1588,8 +1677,8 @@ ${items.join('\n\n')}
       let aiMultiplier = 1.0;
       let aiReasoning = '';
 
-      // ✏️ NEW — short-circuit when AI is enabled but no key is loaded, so we
-      //    don't burn 6 seconds per setup on a request that will just time out.
+      // Short-circuit when AI is enabled but no key is loaded, so we don't
+      // burn 6 seconds per setup on a request that will just time out.
       const aiCanRun = aiValidatorEnabled && isAiValidatorConfigured();
       if (aiValidatorEnabled && !isAiValidatorConfigured()) {
         console.log(
@@ -1696,7 +1785,7 @@ ${items.join('\n\n')}
       busySymbols.add(asset.symbol);
     }
 
-    // ✏️ NEW — diagnostic summary so the console shows exactly what qualified.
+    // Diagnostic summary so the console shows exactly what qualified.
     console.log(
       `[SCAN] Evaluation complete. Qualified setups: ${newPositions.length} ` +
       `(longsQueued=${longsQueued}, shortsQueued=${shortsQueued}, slots=${slots})`
@@ -1712,7 +1801,6 @@ ${items.join('\n\n')}
 
     for (const pos of newPositions) {
       const liveSnapshot = await refreshAccountSnapshot();
-      // ✏️ NEW — per-symbol execution trace.
       console.log(
         `[SCAN] Executing ${pos.symbol} ${pos.direction} — ` +
         `snapshot=${liveSnapshot ? `$${liveSnapshot.availableBalance.toFixed(2)}` : 'null'}`
@@ -1740,7 +1828,6 @@ ${items.join('\n\n')}
       const multiplier = aiMultiplierMap[pos.id] ?? 1.0;
       const qty = Number((baseQty * multiplier).toFixed(8));
 
-      // ✏️ NEW — log the qty result so a zero-qty silent drop is visible.
       console.log(
         `[SCAN] ${pos.symbol} sizing: baseQty=${baseQty} multiplier=${multiplier} qty=${qty}`
       );
@@ -1759,7 +1846,6 @@ ${items.join('\n\n')}
       const requiredMargin = notional / leverage;
       const maxAllowedMargin = (liveSnapshot.availableBalance * MAX_MARGIN_USE_PCT) / 100;
 
-      // ✏️ NEW — log the margin guard decision.
       console.log(
         `[SCAN] ${pos.symbol} margin: required=$${requiredMargin.toFixed(2)} max=$${maxAllowedMargin.toFixed(2)} ` +
         `(${MAX_MARGIN_USE_PCT}% of $${liveSnapshot.availableBalance.toFixed(2)})`
@@ -1781,16 +1867,10 @@ ${items.join('\n\n')}
         ? (livePrice - pos.entryPrice) / pos.entryPrice
         : (pos.entryPrice - livePrice) / pos.entryPrice;
 
-      // ✏️ NEW — log the drift number so we can tune it with real data.
       console.log(
         `[SCAN] ${pos.symbol} drift: entry=$${pos.entryPrice} live=$${livePrice} drift=${(driftPct * 100).toFixed(3)}%`
       );
 
-      // ✏️ WIDENED from 0.4% to 1.0% (MAX_ENTRY_DRIFT_PCT). The scan pipeline
-      //    takes 30-60s from scoring to execution (AI timeouts + 3 candle
-      //    fetches + funding per symbol). On a 0.4%-ATR 5m instrument, a 0.4%+
-      //    move during that window is normal noise — NOT chasing. 1.0% still
-      //    rejects real chases.
       if (Math.abs(driftPct) > MAX_ENTRY_DRIFT_PCT) {
         console.log(
           `[SCAN] ${pos.symbol}: ❌ drift guard tripped (>${(MAX_ENTRY_DRIFT_PCT * 100).toFixed(2)}%) — skipping`
@@ -1816,7 +1896,6 @@ ${items.join('\n\n')}
       }
 
       const side: 'BUY' | 'SELL' = pos.direction.includes('BUY') ? 'BUY' : 'SELL';
-      // ✏️ NEW — pre-order trace so we know the exact qty + price sent.
       console.log(`[SCAN] Placing ${side} order for ${pos.symbol} qty=${qty} entry≈$${livePrice}`);
       const r = await executeBinanceOrderWithStops(pos.symbol, side, qty, pos.stopLoss, pos.takeProfit1);
       console.log(`[SCAN] Order result:`, r);
@@ -1853,6 +1932,106 @@ ${items.join('\n\n')}
 
   const scanFnRef = useRef(handleExecuteCryptoScalpScan);
   useEffect(() => { scanFnRef.current = handleExecuteCryptoScalpScan; });
+
+  // ═════════════════════════════════════════════════════════════════════════
+  // ORPHAN RESCUE — runs once when API keys become available.
+  // Reads /fapi/v2/positionRisk, lists every open position, and warns the
+  // user about any symbol the current `signals` list doesn't know about.
+  // Prevents silent scan-blocking by positions left open by a previous
+  // browser session.
+  // ═════════════════════════════════════════════════════════════════════════
+  const orphanCheckRanRef = useRef(false);
+  useEffect(() => {
+    if (!apiSettings.apiKey || !apiSettings.apiSecret || !apiSettings.enableFutures) return;
+    if (orphanCheckRanRef.current) return;
+    orphanCheckRanRef.current = true;
+
+    (async () => {
+      try {
+        const open = await getAllOpenPositions();
+        if (open.length === 0) {
+          console.log('[orphan] no open positions on Binance');
+          setOrphanPositions([]);
+          return;
+        }
+
+        const trackedSymbols = new Set(
+          signalsRef.current
+            .filter((s) => s.status === 'ACTIVE')
+            .map((s) => s.symbol.replace('/', '').toUpperCase()),
+        );
+
+        const orphans = open.filter((p) => !trackedSymbols.has(p.symbol));
+
+        console.log(
+          `[orphan] Binance has ${open.length} open position(s): ` +
+          open.map((p) => `${p.symbol}(${p.positionAmt})`).join(', ')
+        );
+
+        setOrphanPositions(orphans);
+
+        if (orphans.length > 0) {
+          const list = orphans
+            .map((p) => `${p.symbol} ${p.positionAmt > 0 ? 'LONG' : 'SHORT'} ${Math.abs(p.positionAmt).toFixed(4)}`)
+            .join(' | ');
+          setConnectionLog(
+            `⚠️ ORPHAN POSITIONS DETECTED (${orphans.length}): ${list}. ` +
+            `These silently block new entries on those symbols. Use "Close Orphans" on the banner to fix.`
+          );
+          console.warn('[orphan] ORPHANS:', orphans.map((p) => p.symbol));
+        } else {
+          console.log('[orphan] all Binance positions are tracked in this session ✅');
+        }
+      } catch (err: any) {
+        console.warn('[orphan] check failed:', err.message);
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [apiSettings.apiKey, apiSettings.apiSecret, apiSettings.enableFutures]);
+
+  // ✏️ NEW — Closes every orphan via reduceOnly MARKET orders, one-by-one.
+  const [isClosingOrphans, setIsClosingOrphans] = useState<boolean>(false);
+  const handleCloseAllOrphans = async () => {
+    if (isClosingOrphans || orphanPositions.length === 0) return;
+    setIsClosingOrphans(true);
+    setConnectionLog(`🔒 Closing ${orphanPositions.length} orphan position(s)...`);
+
+    let okCount = 0;
+    let failCount = 0;
+
+    for (const orphan of orphanPositions) {
+      const r = await closeOrphanPosition(orphan);
+      if (r.success) {
+        okCount++;
+        console.log(`[orphan] ✅ Closed ${orphan.symbol} | orderId=${r.orderId}`);
+      } else {
+        failCount++;
+        console.warn(`[orphan] ❌ Failed to close ${orphan.symbol}: ${r.error}`);
+      }
+      await new Promise((res) => setTimeout(res, 300));
+    }
+
+    // Re-read positions after closing
+    await new Promise((res) => setTimeout(res, 1500));
+    const after = await getAllOpenPositions();
+    const trackedSymbols = new Set(
+      signalsRef.current
+        .filter((s) => s.status === 'ACTIVE')
+        .map((s) => s.symbol.replace('/', '').toUpperCase()),
+    );
+    const stillOrphans = after.filter((p) => !trackedSymbols.has(p.symbol));
+    setOrphanPositions(stillOrphans);
+    setOrphanBannerDismissed(false);
+
+    await refreshAccountSnapshot();
+
+    if (stillOrphans.length === 0) {
+      setConnectionLog(`✅ Orphan rescue complete: ${okCount} closed${failCount > 0 ? `, ${failCount} failed` : ''}. All clear — retry FORCE SCAN.`);
+    } else {
+      setConnectionLog(`⚠️ Orphan rescue: ${okCount} closed, ${failCount} failed. ${stillOrphans.length} still open — retry manually.`);
+    }
+    setIsClosingOrphans(false);
+  };
 
   // ═════════════════════════════════════════════════════════════════════════
   // REDUCE-ONLY CLOSER
@@ -2209,6 +2388,37 @@ ${items.join('\n\n')}
         </div>
       )}
 
+      {/* ✏️ NEW — Orphan positions banner */}
+      {orphanPositions.length > 0 && !orphanBannerDismissed && (
+        <div className="bg-amber-600/20 border-b-2 border-amber-500 px-4 py-2 text-[12px] font-mono text-amber-100 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2 flex-wrap">
+            <AlertTriangle className="w-5 h-5 text-amber-300 shrink-0 animate-pulse" />
+            <span>
+              <strong>ORPHAN POSITIONS ({orphanPositions.length})</strong> — these will silently block new entries on their symbols:{' '}
+              <span className="font-bold text-amber-200">
+                {orphanPositions.map((p) => `${p.symbol} ${p.positionAmt > 0 ? 'LONG' : 'SHORT'} ${Math.abs(p.positionAmt).toFixed(4)}`).join(' | ')}
+              </span>
+            </span>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              onClick={handleCloseAllOrphans}
+              disabled={isClosingOrphans}
+              className="px-3 py-1 rounded bg-amber-500/30 hover:bg-amber-500/50 text-amber-50 border border-amber-400/60 text-[10px] font-bold cursor-pointer disabled:opacity-50"
+            >
+              {isClosingOrphans ? 'Closing...' : 'Close All Orphans'}
+            </button>
+            <button
+              onClick={() => setOrphanBannerDismissed(true)}
+              className="px-2 py-1 rounded bg-slate-800/80 hover:bg-slate-700 text-slate-300 border border-slate-600 text-[10px] font-bold cursor-pointer"
+              title="Dismiss (does not close positions)"
+            >
+              Dismiss
+            </button>
+          </div>
+        </div>
+      )}
+
       {apiSettings.geoBlocked && (
         <div className="bg-rose-500/10 border-b border-rose-500/30 px-4 py-2 text-[11px] font-mono text-rose-300 flex items-center justify-between gap-3">
           <div className="flex items-center gap-2">
@@ -2337,8 +2547,9 @@ ${items.join('\n\n')}
 
                 <button
                   onClick={handleExecuteCryptoScalpScan}
-                  disabled={isScanning || assets.length === 0 || activeTrades.length >= MAX_ACTIVE_TRADES || killSwitchOn}
+                  disabled={isScanning || assets.length === 0 || activeTrades.length >= MAX_ACTIVE_TRADES || killSwitchOn || orphanPositions.length > 0}
                   className="px-4 py-1.5 bg-gradient-to-r from-emerald-500 to-teal-400 hover:from-emerald-400 hover:to-teal-300 text-slate-950 font-black rounded-lg text-xs transition-all shadow-md flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-50"
+                  title={orphanPositions.length > 0 ? 'Close orphan positions first' : ''}
                 >
                   {isScanning ? (
                     <><Sparkles className="w-3.5 h-3.5 animate-spin text-slate-950" /><span>Scanning...</span></>
@@ -2540,6 +2751,30 @@ ${items.join('\n\n')}
                 </div>
               )}
 
+              {orphanPositions.length > 0 && (
+                <div className="p-3 bg-amber-500/10 border border-amber-500/40 rounded-xl">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="flex-1">
+                      <span className="text-xs font-bold text-amber-200 block mb-1">Orphan Positions ({orphanPositions.length})</span>
+                      <div className="text-[11px] font-mono text-amber-200/90 space-y-0.5">
+                        {orphanPositions.map((p) => (
+                          <div key={p.symbol}>
+                            {p.symbol} · {p.positionAmt > 0 ? 'LONG' : 'SHORT'} {Math.abs(p.positionAmt).toFixed(4)} · entry ${p.entryPrice.toFixed(4)} · uPnL ${p.unRealizedProfit.toFixed(2)}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                    <button
+                      onClick={handleCloseAllOrphans}
+                      disabled={isClosingOrphans}
+                      className="px-3 py-1.5 bg-amber-500/30 hover:bg-amber-500/50 text-amber-50 border border-amber-400/60 text-xs font-bold rounded-lg cursor-pointer disabled:opacity-50 shrink-0"
+                    >
+                      {isClosingOrphans ? 'Closing...' : 'Close All'}
+                    </button>
+                  </div>
+                </div>
+              )}
+
               <div className="p-3 bg-slate-950 rounded-xl border border-emerald-500/30 flex items-center justify-between">
                 <div>
                   <span className="text-xs font-bold text-white block">Test Mode (Skip Kill Zones)</span>
@@ -2585,6 +2820,7 @@ ${items.join('\n\n')}
                         setApiSettings((p) => ({ ...p, environment: env, geoBlocked: false, lastError: null }));
                         listenKeyAttemptedRef.current = false;
                         listenKeyFatalRef.current = false;
+                        orphanCheckRanRef.current = false; // re-check orphans on env change
                       }}
                       className={`px-3 py-2 rounded-lg text-xs font-bold font-mono border transition-colors cursor-pointer ${
                         apiSettings.environment === env
@@ -2691,7 +2927,8 @@ ${items.join('\n\n')}
                 <div>✅ Daily-P&amp;L gate triggers on drawdown only (winning days never pause the bot)</div>
                 <div>✅ AI-unavailable warning surfaced to dashboard + console once per session</div>
                 <div>✅ AI short-circuit when no key loaded (saves ~6s per setup)</div>
-                <div>✅ Execution-phase diagnostics logged for every qualified setup</div>
+                <div>✅ Orphan-position rescue on startup (banner + Close All button)</div>
+                <div>✅ FORCE SCAN disabled while orphans exist (prevents silent skip)</div>
                 <div>{aiValidatorEnabled && isAiValidatorConfigured() ? '✅ AI Trade Validator ON (fires on every setup ≥ 70, receives funding + win-rate context)' : aiValidatorEnabled ? '⚠️ AI Validator toggled ON but no key loaded — running rules-only' : '⏸ AI Trade Validator OFF'}</div>
               </div>
             </div>
