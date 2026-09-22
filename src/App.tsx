@@ -66,15 +66,26 @@ const MIN_CONFLUENCE_SCORE = 70;
 const MIN_KILLZONE_WEIGHT = 0.3;
 const SKIP_KILLZONE_DEFAULT = true;
 
-const MAX_ACTIVE_TRADES = 6;
-// Correlated-loss protection: crypto is 70-80% correlated, so capping at 2
-// same-direction positions limits worst-case loss to ~-2% during dumps.
-const MAX_SAME_DIRECTION = 2;
-const MAX_MARGIN_USE_PCT = 30;
+// $100 LIVE MODE: 2 concurrent max. At 20% margin each that's 40% total
+// exposure — leaves 60% headroom for adverse moves.
+const MAX_ACTIVE_TRADES = 2;
+
+// $100 LIVE MODE: 1 position per direction. Prevents 2-3 correlated SLs
+// from blowing through the -10% kill switch on a single crypto dump.
+const MAX_SAME_DIRECTION = 1;
+
+// $100 LIVE MODE: 20% margin per trade (was 30%). On a $100 account this
+// is $20 margin per order — leaves room for adverse moves + fees.
+const MAX_MARGIN_USE_PCT = 20;
+
 const MAX_DAILY_LOSS_PCT = 10;
 const BALANCE_STALE_MS = 60_000;
 const BALANCE_REFRESH_MS = 20_000;
-const COOLDOWN_AFTER_SL_MS = 15 * 60_000;
+
+// $100 LIVE MODE: 1-hour cooldown after SL. Today's log showed DOT entered
+// and stopped out 4 times in 3 hours — pure thrashing. 15min was too short.
+const COOLDOWN_AFTER_SL_MS = 60 * 60_000;
+
 const MAX_CONSECUTIVE_FAILURES = 3;
 
 const CANDLE_CLOSE_WINDOW_SEC = 30;
@@ -109,9 +120,11 @@ let __marketWs: WebSocket | null = null;
 let __marketWsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let __marketWsUrlIndex = 0;
 
+// $100 LIVE MODE: only BTC/ETH/SOL. Highest liquidity = tightest spreads
+// = lowest fee drag. Smaller coins have tick sizes too large for $100 —
+// you'd get "qty rounds to 0" rejections or 15-30% slippage on fills.
 const SCAN_WHITELIST = new Set<string>([
-  'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT',
-  'ADA/USDT', 'DOGE/USDT', 'AVAX/USDT', 'LINK/USDT', 'DOT/USDT',
+  'BTC/USDT', 'ETH/USDT', 'SOL/USDT',
 ]);
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -401,6 +414,12 @@ export const App: React.FC = () => {
     map: {},
     fetchedAt: 0,
   });
+
+  // $100 LIVE MODE: per-symbol daily entry counter. Prevents the bot from
+  // re-entering the same symbol over and over in chop. Key = "YYYY-MM-DD|SYMBOL",
+  // value = count of entries today. Max 2 entries per symbol per UTC day.
+  const dailyEntryCountRef = useRef<Record<string, number>>({});
+  const MAX_ENTRIES_PER_SYMBOL_PER_DAY = 2;
 
   const tripKillSwitch = (reason: string) => {
     if (killSwitchRef.current) return;
@@ -706,7 +725,12 @@ export const App: React.FC = () => {
   useEffect(() => {
     const rollover = () => {
       const today = new Date().toISOString().slice(0, 10);
-      if (dailyPnlRef.current.day !== today) dailyPnlRef.current = { day: today, pnl: 0 };
+      if (dailyPnlRef.current.day !== today) {
+        dailyPnlRef.current = { day: today, pnl: 0 };
+        // $100 LIVE MODE: also clear the per-symbol daily entry counter.
+        dailyEntryCountRef.current = {};
+        console.log(`[DAY-ROLLOVER] Daily PnL + per-symbol entry counts reset for ${today}`);
+      }
     };
     rollover();
     const t = setInterval(rollover, 30_000);
@@ -1649,6 +1673,18 @@ ${items.join('\n\n')}
       if (newPositions.length >= slots) break;
       if (error || candles.length < 30) continue;
 
+      // $100 LIVE MODE: per-symbol daily entry cap. Prevents DOT-style
+      // thrashing where the bot re-enters the same symbol after each SL.
+      const todayKey = `${new Date().toISOString().slice(0, 10)}|${asset.symbol}`;
+      const todayCount = dailyEntryCountRef.current[todayKey] ?? 0;
+      if (todayCount >= MAX_ENTRIES_PER_SYMBOL_PER_DAY) {
+        console.log(
+          `[SCAN] ${asset.symbol}: ❌ daily entry cap reached ` +
+          `(${todayCount}/${MAX_ENTRIES_PER_SYMBOL_PER_DAY}) — skipping`
+        );
+        continue;
+      }
+
       const confluence = scoreConfluence(candles);
       console.log(`[SCAN] ${asset.symbol}: 5m score=${confluence.total.toFixed(0)} dir=${confluence.direction} | ${confluence.reasons.join(', ')}`);
 
@@ -1968,6 +2004,13 @@ ${items.join('\n\n')}
         reasoning: pos.reasoning, binanceOrderId: r.orderId,
         environment: apiSettings.environment, usdtBalance: liveSnapshot.availableBalance,
       });
+
+      // $100 LIVE MODE: increment per-symbol daily counter after success.
+      const todayKey = `${new Date().toISOString().slice(0, 10)}|${pos.symbol}`;
+      dailyEntryCountRef.current[todayKey] = (dailyEntryCountRef.current[todayKey] ?? 0) + 1;
+      console.log(
+        `[SCAN] ${pos.symbol}: daily entry count → ${dailyEntryCountRef.current[todayKey]}/${MAX_ENTRIES_PER_SYMBOL_PER_DAY}`
+      );
 
       patchSignal(pos.id, {
         ...(r.orderId ? { binanceOrderId: r.orderId } : {}),
@@ -3124,7 +3167,9 @@ ${items.join('\n\n')}
                 <div>✅ Orphan rescue: "ALL positions are orphans" warning (redeploy signature)</div>
                 <div>✅ Orphan close: requires explicit window.confirm() with position list</div>
                 <div>✅ FORCE SCAN disabled while orphans exist (prevents silent skip)</div>
-                <div>✅ Direction cap reduced to {MAX_SAME_DIRECTION}/side (correlated-loss protection)</div>
+                <div>✅ $100 MODE: direction cap = {MAX_SAME_DIRECTION}/side, max {MAX_ACTIVE_TRADES} concurrent</div>
+                <div>✅ $100 MODE: margin ≤ {MAX_MARGIN_USE_PCT}% per trade, whitelist = {SCAN_WHITELIST.size} liquid majors</div>
+                <div>✅ $100 MODE: SL cooldown = {Math.round(COOLDOWN_AFTER_SL_MS / 60000)}min, max {MAX_ENTRIES_PER_SYMBOL_PER_DAY} entries/symbol/day</div>
                 <div>✅ Time stop: dead 5m scalps recycled after {Math.round(TIME_STOP_MS / 60000)}m if PnL between {TIME_STOP_MIN_PNL}% and +{TIME_STOP_MAX_PNL}%</div>
                 <div>✅ SHORT-WATCH + SHORT-CANDIDATE diagnostics visible in console</div>
                 <div>{aiValidatorEnabled && isAiValidatorConfigured() ? '✅ AI Trade Validator ON (fires on every setup ≥ 70, receives funding + win-rate context)' : aiValidatorEnabled ? '⚠️ AI Validator toggled ON but no key loaded — running rules-only' : '⏸ AI Trade Validator OFF'}</div>
@@ -3135,11 +3180,11 @@ ${items.join('\n\n')}
               <h4 className="text-xs font-bold text-white mb-2">📱 Phone Alerts Enabled</h4>
               <div className="text-[11px] text-slate-400 space-y-1 font-mono">
                 <div>✅ Trade opened → Telegram</div>
-                <div>✅ Trade closed (TP/SL) → Telegram</div>
+                <div>🔇 Trade closed → console + journal only (silent)</div>
                 <div>✅ Daily drawdown hit → Telegram</div>
                 <div>✅ Geo-block detected → Telegram</div>
                 <div>✅ Bot start/stop → Telegram</div>
-                <div>✅ Killzone enter/exit → Telegram</div>
+                <div>🔇 Killzone enter/exit → console only (silent)</div>
               </div>
             </div>
 
