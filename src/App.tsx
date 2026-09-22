@@ -67,8 +67,8 @@ const MIN_KILLZONE_WEIGHT = 0.3;
 const SKIP_KILLZONE_DEFAULT = true;
 
 const MAX_ACTIVE_TRADES = 6;
-// ✏️ CHANGED from 3 to 2 — crypto is 70-80% correlated; capping at 2 limits
-// same-direction worst-case loss to ~-2% instead of ~-3% during correlated dumps.
+// Correlated-loss protection: crypto is 70-80% correlated, so capping at 2
+// same-direction positions limits worst-case loss to ~-2% during dumps.
 const MAX_SAME_DIRECTION = 2;
 const MAX_MARGIN_USE_PCT = 30;
 const MAX_DAILY_LOSS_PCT = 10;
@@ -89,7 +89,7 @@ const USER_STREAM_KEEPALIVE_MS = 25 * 60_000; // 25 min (safe margin below Binan
 // 30-60s (AI timeouts + 3 candle fetches + funding per symbol).
 const MAX_ENTRY_DRIFT_PCT = 0.010;
 
-// ✏️ NEW — Time stop: recycle dead 5m scalps after 30 minutes of no progress.
+// Time stop: recycle dead 5m scalps after 30 minutes of no progress.
 // Only fires when PnL is between MIN and MAX (i.e., the trade is "flat").
 // Doesn't fire if the trade is already heading to SL (below -0.5%) or
 // already working (above +0.3%). Frees the symbol slot + margin.
@@ -1652,8 +1652,7 @@ ${items.join('\n\n')}
       const confluence = scoreConfluence(candles);
       console.log(`[SCAN] ${asset.symbol}: 5m score=${confluence.total.toFixed(0)} dir=${confluence.direction} | ${confluence.reasons.join(', ')}`);
 
-      // ✏️ NEW — SHORT-WATCH: near-miss short setups (score 50-69 with bearish reasons).
-      // Makes short-side activity visible in the console even when nothing qualifies.
+      // SHORT-WATCH: near-miss short setups (score 50-69 with bearish reasons).
       if (confluence.total >= 50 && confluence.total < MIN_CONFLUENCE_SCORE) {
         const shortLeaning = confluence.reasons.some((r) => {
           const lower = r.toLowerCase();
@@ -1679,8 +1678,8 @@ ${items.join('\n\n')}
       const trend15m = scoreConfluence(candles15m);
       console.log(`[SCAN] ${asset.symbol}: 15m score=${trend15m.total.toFixed(0)} dir=${trend15m.direction}`);
 
-      // ✏️ NEW — SHORT-CANDIDATE: 5m is SHORT but 15m disagrees. The 15m gate
-      // below will reject it — this log makes the rejection visible/explainable.
+      // SHORT-CANDIDATE: 5m is SHORT but 15m disagrees. The 15m gate below
+      // will reject it — this log makes the rejection visible/explainable.
       if (confluence.direction === 'SHORT' && trend15m.direction !== 'SHORT') {
         console.log(
           `[SCAN] ${asset.symbol}: [SHORT-CANDIDATE] 5m=${confluence.total.toFixed(0)} SHORT, ` +
@@ -1990,10 +1989,14 @@ ${items.join('\n\n')}
 
   // ═════════════════════════════════════════════════════════════════════════
   // ORPHAN RESCUE — runs once when API keys become available.
-  // Reads /fapi/v2/positionRisk, lists every open position, and warns the
-  // user about any symbol the current `signals` list doesn't know about.
-  // Prevents silent scan-blocking by positions left open by a previous
-  // browser session.
+  //
+  // SAFETY PATCHES (redeploy proof):
+  //   1. Waits 5s after mount so React has time to hydrate `signals` from
+  //      localStorage before comparing against Binance. Prevents false-
+  //      positive orphan flagging right after a redeploy.
+  //   2. Logs the tracked set AND the Binance set so we can diagnose.
+  //   3. If ALL Binance positions are unknown, warns loudly — that's a
+  //      redeploy-wiped-localStorage signature, NOT normal orphans.
   // ═════════════════════════════════════════════════════════════════════════
   const orphanCheckRanRef = useRef(false);
   useEffect(() => {
@@ -2003,6 +2006,12 @@ ${items.join('\n\n')}
 
     (async () => {
       try {
+        // Wait 5 seconds after mount so `signals` has settled from
+        // localStorage before we compare against Binance. Without this,
+        // a slow localStorage read + fast Binance call can flag our own
+        // freshly-opened trades as orphans after a redeploy.
+        await new Promise((r) => setTimeout(r, 5000));
+
         const open = await getAllOpenPositions();
         if (open.length === 0) {
           console.log('[orphan] no open positions on Binance');
@@ -2014,6 +2023,14 @@ ${items.join('\n\n')}
           signalsRef.current
             .filter((s) => s.status === 'ACTIVE')
             .map((s) => s.symbol.replace('/', '').toUpperCase()),
+        );
+
+        // Diagnostic logging — lets us see exactly what we're comparing.
+        console.log(
+          `[orphan] tracked (from signals): [${Array.from(trackedSymbols).join(', ') || '(empty)'}]`
+        );
+        console.log(
+          `[orphan] on Binance: [${open.map((p) => p.symbol).join(', ')}]`
         );
 
         const orphans = open.filter((p) => !trackedSymbols.has(p.symbol));
@@ -2029,10 +2046,18 @@ ${items.join('\n\n')}
           const list = orphans
             .map((p) => `${p.symbol} ${p.positionAmt > 0 ? 'LONG' : 'SHORT'} ${Math.abs(p.positionAmt).toFixed(4)}`)
             .join(' | ');
-          setConnectionLog(
-            `⚠️ ORPHAN POSITIONS DETECTED (${orphans.length}): ${list}. ` +
-            `These silently block new entries on those symbols. Use "Close Orphans" on the banner to fix.`
-          );
+
+          // If every Binance position is unknown, this is likely a redeploy
+          // that wiped localStorage — NOT a stale-orphan situation. Warn hard.
+          const allAreOrphans = orphans.length === open.length;
+          const warning = allAreOrphans
+            ? `⚠️ ALL ${open.length} BINANCE POSITIONS are unknown to this session. ` +
+              `This usually means localStorage was cleared by a redeploy. ` +
+              `CHECK before closing — these may be YOUR trades.`
+            : `⚠️ ORPHAN POSITIONS (${orphans.length}): ${list}.`;
+
+          setConnectionLog(`${warning} Positions: ${list}.`);
+          console.warn('[orphan] WARNING:', warning);
           console.warn('[orphan] ORPHANS:', orphans.map((p) => p.symbol));
         } else {
           console.log('[orphan] all Binance positions are tracked in this session ✅');
@@ -2045,9 +2070,27 @@ ${items.join('\n\n')}
   }, [apiSettings.apiKey, apiSettings.apiSecret, apiSettings.enableFutures]);
 
   // Closes every orphan via reduceOnly MARKET orders, one-by-one.
+  // SAFETY: requires an explicit window.confirm() listing every position
+  // before it fires. Prevents accidental closing of legit trades after a
+  // redeploy wiped the local `signals` state.
   const [isClosingOrphans, setIsClosingOrphans] = useState<boolean>(false);
   const handleCloseAllOrphans = async () => {
     if (isClosingOrphans || orphanPositions.length === 0) return;
+
+    const list = orphanPositions
+      .map((p) => `${p.symbol} ${p.positionAmt > 0 ? 'LONG' : 'SHORT'} ${Math.abs(p.positionAmt).toFixed(4)}`)
+      .join('\n');
+    const confirmed = window.confirm(
+      `Close ${orphanPositions.length} position(s)?\n\n${list}\n\n` +
+      `⚠️ WARNING: If these are YOUR trades that the bot opened, closing them will exit the position at market price. ` +
+      `Confirm only if you're sure they are stale/orphaned positions.\n\n` +
+      `Click OK to close, Cancel to abort.`
+    );
+    if (!confirmed) {
+      setConnectionLog('🚫 Orphan close cancelled by user.');
+      return;
+    }
+
     setIsClosingOrphans(true);
     setConnectionLog(`🔒 Closing ${orphanPositions.length} orphan position(s)...`);
 
@@ -3077,7 +3120,9 @@ ${items.join('\n\n')}
                 <div>✅ Daily-P&amp;L gate triggers on drawdown only (winning days never pause the bot)</div>
                 <div>✅ AI-unavailable warning surfaced to dashboard + console once per session</div>
                 <div>✅ AI short-circuit when no key loaded (saves ~6s per setup)</div>
-                <div>✅ Orphan-position rescue on startup (banner + Close All button)</div>
+                <div>✅ Orphan rescue: 5s mount delay + full diagnostic logging (tracked vs Binance)</div>
+                <div>✅ Orphan rescue: "ALL positions are orphans" warning (redeploy signature)</div>
+                <div>✅ Orphan close: requires explicit window.confirm() with position list</div>
                 <div>✅ FORCE SCAN disabled while orphans exist (prevents silent skip)</div>
                 <div>✅ Direction cap reduced to {MAX_SAME_DIRECTION}/side (correlated-loss protection)</div>
                 <div>✅ Time stop: dead 5m scalps recycled after {Math.round(TIME_STOP_MS / 60000)}m if PnL between {TIME_STOP_MIN_PNL}% and +{TIME_STOP_MAX_PNL}%</div>
