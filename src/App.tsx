@@ -67,7 +67,9 @@ const MIN_KILLZONE_WEIGHT = 0.3;
 const SKIP_KILLZONE_DEFAULT = true;
 
 const MAX_ACTIVE_TRADES = 6;
-const MAX_SAME_DIRECTION = 3;
+// ✏️ CHANGED from 3 to 2 — crypto is 70-80% correlated; capping at 2 limits
+// same-direction worst-case loss to ~-2% instead of ~-3% during correlated dumps.
+const MAX_SAME_DIRECTION = 2;
 const MAX_MARGIN_USE_PCT = 30;
 const MAX_DAILY_LOSS_PCT = 10;
 const BALANCE_STALE_MS = 60_000;
@@ -87,6 +89,14 @@ const USER_STREAM_KEEPALIVE_MS = 25 * 60_000; // 25 min (safe margin below Binan
 // 30-60s (AI timeouts + 3 candle fetches + funding per symbol).
 const MAX_ENTRY_DRIFT_PCT = 0.010;
 
+// ✏️ NEW — Time stop: recycle dead 5m scalps after 30 minutes of no progress.
+// Only fires when PnL is between MIN and MAX (i.e., the trade is "flat").
+// Doesn't fire if the trade is already heading to SL (below -0.5%) or
+// already working (above +0.3%). Frees the symbol slot + margin.
+const TIME_STOP_MS = 30 * 60_000;
+const TIME_STOP_MIN_PNL = -0.5;
+const TIME_STOP_MAX_PNL = 0.3;
+
 // ═══════════════════════════════════════════════════════════════════════════
 // MARKET DATA WEBSOCKET — module-level singleton
 // ═══════════════════════════════════════════════════════════════════════════
@@ -103,6 +113,24 @@ const SCAN_WHITELIST = new Set<string>([
   'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT',
   'ADA/USDT', 'DOGE/USDT', 'AVAX/USDT', 'LINK/USDT', 'DOT/USDT',
 ]);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DEBUG BRIDGE — exposes pure scoring functions on window so the browser
+// console can call them directly (import() is blocked by AI Studio's CSP).
+// Read-only; does not affect production behavior.
+// ═══════════════════════════════════════════════════════════════════════════
+if (typeof window !== 'undefined') {
+  (window as any).__signalEngine = {
+    scoreConfluence,
+    buildRiskLevels,
+    positionSize,
+    isInKillZone,
+  };
+  console.log(
+    '%c🧪 Debug bridge ready — try: window.__signalEngine.scoreConfluence([...])',
+    'color:#9D4EDD;font-style:italic'
+  );
+}
 
 const getCorsProxyUrl = (targetUrl: string): string => {
   const isLocal =
@@ -298,7 +326,7 @@ export const App: React.FC = () => {
 
   const [accountSnapshot, setAccountSnapshot] = useState<AccountSnapshot | null>(null);
 
-  // ✏️ NEW — Orphan positions detected on Binance at startup
+  // Orphan positions detected on Binance at startup
   const [orphanPositions, setOrphanPositions] = useState<OrphanPosition[]>([]);
   const [orphanBannerDismissed, setOrphanBannerDismissed] = useState<boolean>(false);
 
@@ -508,7 +536,7 @@ export const App: React.FC = () => {
     } catch { return 0; }
   };
 
-  // ✏️ NEW — Returns ALL open positions from Binance, for orphan detection.
+  // Returns ALL open positions from Binance, for orphan detection.
   const getAllOpenPositions = async (): Promise<OrphanPosition[]> => {
     if (!apiSettings.apiKey || !apiSettings.apiSecret || !apiSettings.enableFutures) return [];
     const baseUrl = getBaseUrl(apiSettings.environment, true);
@@ -537,7 +565,7 @@ export const App: React.FC = () => {
     } catch { return []; }
   };
 
-  // ✏️ NEW — Closes a single orphan position via reduceOnly MARKET order.
+  // Closes a single orphan position via reduceOnly MARKET order.
   const closeOrphanPosition = async (orphan: OrphanPosition): Promise<{ success: boolean; orderId?: string; error?: string }> => {
     const isFutures = apiSettings.enableFutures;
     const baseUrl = getBaseUrl(apiSettings.environment, isFutures);
@@ -1624,6 +1652,23 @@ ${items.join('\n\n')}
       const confluence = scoreConfluence(candles);
       console.log(`[SCAN] ${asset.symbol}: 5m score=${confluence.total.toFixed(0)} dir=${confluence.direction} | ${confluence.reasons.join(', ')}`);
 
+      // ✏️ NEW — SHORT-WATCH: near-miss short setups (score 50-69 with bearish reasons).
+      // Makes short-side activity visible in the console even when nothing qualifies.
+      if (confluence.total >= 50 && confluence.total < MIN_CONFLUENCE_SCORE) {
+        const shortLeaning = confluence.reasons.some((r) => {
+          const lower = r.toLowerCase();
+          return lower.includes('bearish')
+            || lower.includes('price < ema50')
+            || (lower.includes('vol') && lower.includes('bear'));
+        });
+        if (shortLeaning) {
+          console.log(
+            `[SCAN] ${asset.symbol}: [SHORT-WATCH] 5m=${confluence.total.toFixed(0)} — below ${MIN_CONFLUENCE_SCORE} threshold. ` +
+            confluence.reasons.join(', ')
+          );
+        }
+      }
+
       if (confluence.total < MIN_CONFLUENCE_SCORE || confluence.direction === 'NONE') continue;
 
       const { candles: candles15m } = await getRealCandles(asset.symbol, '15m', 60);
@@ -1633,6 +1678,16 @@ ${items.join('\n\n')}
       }
       const trend15m = scoreConfluence(candles15m);
       console.log(`[SCAN] ${asset.symbol}: 15m score=${trend15m.total.toFixed(0)} dir=${trend15m.direction}`);
+
+      // ✏️ NEW — SHORT-CANDIDATE: 5m is SHORT but 15m disagrees. The 15m gate
+      // below will reject it — this log makes the rejection visible/explainable.
+      if (confluence.direction === 'SHORT' && trend15m.direction !== 'SHORT') {
+        console.log(
+          `[SCAN] ${asset.symbol}: [SHORT-CANDIDATE] 5m=${confluence.total.toFixed(0)} SHORT, ` +
+          `but 15m=${trend15m.total.toFixed(0)} ${trend15m.direction} — 15m trend gate blocked it`
+        );
+      }
+
       if (confluence.direction === 'LONG' && trend15m.direction !== 'LONG') {
         console.log(`[SCAN] ${asset.symbol}: ❌ rejected — 5m LONG but 15m is ${trend15m.direction}`);
         continue;
@@ -1989,7 +2044,7 @@ ${items.join('\n\n')}
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [apiSettings.apiKey, apiSettings.apiSecret, apiSettings.enableFutures]);
 
-  // ✏️ NEW — Closes every orphan via reduceOnly MARKET orders, one-by-one.
+  // Closes every orphan via reduceOnly MARKET orders, one-by-one.
   const [isClosingOrphans, setIsClosingOrphans] = useState<boolean>(false);
   const handleCloseAllOrphans = async () => {
     if (isClosingOrphans || orphanPositions.length === 0) return;
@@ -2080,6 +2135,98 @@ ${items.join('\n\n')}
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [signals, apiSettings.apiKey, apiSettings.apiSecret]);
+
+  // ═════════════════════════════════════════════════════════════════════════
+  // TIME STOP — every 60s, look for stale 5m scalps that aren't working.
+  // Closes them via market order (cancelling algo stops first) so the symbol
+  // slot and margin return to the pool. Only fires for trades whose PnL sits
+  // between TIME_STOP_MIN_PNL and TIME_STOP_MAX_PNL — anything trending toward
+  // SL or already profitable is left alone to hit its own exit.
+  // ═════════════════════════════════════════════════════════════════════════
+  useEffect(() => {
+    if (!apiSettings.apiKey || !apiSettings.apiSecret || !apiSettings.enableFutures) return;
+
+    const interval = setInterval(async () => {
+      const now = Date.now();
+
+      const stale = signalsRef.current.filter((sig) => {
+        if (sig.status !== 'ACTIVE') return false;
+        const ageMs = now - (sig.startTime || sig.createdAt || 0);
+        if (ageMs < TIME_STOP_MS) return false;
+        const pnl = sig.pnlPercentage ?? 0;
+        if (pnl <= TIME_STOP_MIN_PNL || pnl >= TIME_STOP_MAX_PNL) return false;
+        return true;
+      });
+
+      if (stale.length === 0) return;
+
+      console.log(`[TIME-STOP] Found ${stale.length} stale trade(s) to recycle`);
+
+      for (const trade of stale) {
+        const ageMin = Math.round((now - (trade.startTime || trade.createdAt || 0)) / 60_000);
+        const pnl = Number((trade.pnlPercentage ?? 0).toFixed(3));
+        console.log(
+          `[TIME-STOP] ${trade.symbol} — ${ageMin}m old, pnl=${pnl}% — closing`
+        );
+
+        // 1) Cancel algo orders on Binance (if any) so nothing dangles.
+        if (trade.binanceSlOrderId || trade.binanceTpOrderId) {
+          try {
+            const sym = trade.symbol.replace('/', '').toUpperCase();
+            await cancelAllAlgoOrders(sym);
+          } catch (err: any) {
+            console.warn(`[TIME-STOP] cancelAlgo failed for ${trade.symbol}:`, err.message);
+          }
+        }
+
+        // 2) Market close via reduceOnly.
+        const balance = accountSnapshotRef.current?.availableBalance ?? 0;
+        if (balance > 0) {
+          const dist = Math.abs(trade.entryPrice - trade.stopLoss);
+          const qty = trade.binanceQty ?? positionSize(trade.symbol, trade.entryPrice, dist, balance);
+          if (qty > 0) {
+            const closeSide: 'BUY' | 'SELL' = trade.direction.includes('BUY') ? 'SELL' : 'BUY';
+            const r = await executeBinanceOrder(trade.symbol, closeSide, qty, 'MARKET', undefined, true);
+            if (r.success) {
+              console.log(`[TIME-STOP] ✅ ${trade.symbol} closed on Binance | orderId=${r.orderId}`);
+            } else if (r.error) {
+              const benign =
+                r.error.includes('-2022') ||
+                r.error.includes('-2011') ||
+                r.error.includes('ReduceOnly') ||
+                r.error.includes('no position');
+              if (!benign) console.warn(`[TIME-STOP] ❌ ${trade.symbol} close failed: ${r.error}`);
+            }
+          }
+        }
+
+        // 3) Mark handled (so reduce-only effect skips it).
+        markClosedHandled(trade.id);
+
+        // 4) Journal + Telegram.
+        const exit = trade.currentPrice || trade.entryPrice;
+        recordClosedSignalToJournal(trade, exit, 'TIME_STOP', pnl);
+        alertTradeClosed({
+          symbol: trade.symbol, direction: trade.direction,
+          entryPrice: trade.entryPrice, exitPrice: exit,
+          pnlPercentage: pnl, outcome: 'TIME_STOP',
+          duration: formatDuration(trade.startTime || Date.now()),
+          environment: apiSettings.environment,
+        });
+
+        // 5) Update state (both React and ref).
+        patchSignal(trade.id, {
+          status: 'CLOSED',
+          outcome: 'TIME_STOP',
+          closedAt: Date.now(),
+          pnlPercentage: pnl,
+        });
+      }
+    }, 60_000);
+
+    return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [apiSettings.apiKey, apiSettings.apiSecret, apiSettings.enableFutures]);
 
   useEffect(() => {
     if (!isAutoPilotActive) return;
@@ -2388,7 +2535,7 @@ ${items.join('\n\n')}
         </div>
       )}
 
-      {/* ✏️ NEW — Orphan positions banner */}
+      {/* Orphan positions banner */}
       {orphanPositions.length > 0 && !orphanBannerDismissed && (
         <div className="bg-amber-600/20 border-b-2 border-amber-500 px-4 py-2 text-[12px] font-mono text-amber-100 flex items-center justify-between gap-3">
           <div className="flex items-center gap-2 flex-wrap">
@@ -2503,6 +2650,9 @@ ${items.join('\n\n')}
                     </span>
                     <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-orange-500/20 text-orange-300 border border-orange-500/30">
                       MARGIN ≤ {MAX_MARGIN_USE_PCT}%
+                    </span>
+                    <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-sky-500/20 text-sky-300 border border-sky-500/30">
+                      TIME STOP {Math.round(TIME_STOP_MS / 60000)}m
                     </span>
                     {aiValidatorEnabled && (
                       <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-purple-500/20 text-purple-300 border border-purple-500/30 flex items-center gap-1">
@@ -2929,6 +3079,9 @@ ${items.join('\n\n')}
                 <div>✅ AI short-circuit when no key loaded (saves ~6s per setup)</div>
                 <div>✅ Orphan-position rescue on startup (banner + Close All button)</div>
                 <div>✅ FORCE SCAN disabled while orphans exist (prevents silent skip)</div>
+                <div>✅ Direction cap reduced to {MAX_SAME_DIRECTION}/side (correlated-loss protection)</div>
+                <div>✅ Time stop: dead 5m scalps recycled after {Math.round(TIME_STOP_MS / 60000)}m if PnL between {TIME_STOP_MIN_PNL}% and +{TIME_STOP_MAX_PNL}%</div>
+                <div>✅ SHORT-WATCH + SHORT-CANDIDATE diagnostics visible in console</div>
                 <div>{aiValidatorEnabled && isAiValidatorConfigured() ? '✅ AI Trade Validator ON (fires on every setup ≥ 70, receives funding + win-rate context)' : aiValidatorEnabled ? '⚠️ AI Validator toggled ON but no key loaded — running rules-only' : '⏸ AI Trade Validator OFF'}</div>
               </div>
             </div>
