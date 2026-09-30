@@ -1,14 +1,15 @@
+// src/components/TrackRecord.tsx
 import React, { useState, useMemo, useEffect } from 'react';
 import { ClosedSignal, PerformanceStats } from '../types';
-import { 
-  Trophy, 
-  TrendingUp, 
-  Target, 
-  PieChart, 
-  Calendar, 
-  CheckCircle2, 
-  XCircle, 
-  ArrowUpRight, 
+import {
+  Trophy,
+  TrendingUp,
+  Target,
+  PieChart,
+  Calendar,
+  CheckCircle2,
+  XCircle,
+  ArrowUpRight,
   ArrowDownRight,
   ShieldAlert,
   Search,
@@ -200,7 +201,11 @@ const INITIAL_CLOSED_SIGNALS: ClosedSignal[] = [
   }
 ];
 
-// Helper to deduplicate closed signals by ID to prevent key collisions
+// ─────────────────────────────────────────────────────────────────────────
+// Dedup helpers
+// ─────────────────────────────────────────────────────────────────────────
+
+/** Remove entries with duplicate IDs (rare, but possible from legacy writes). */
 const sanitizeClosedSignals = (items: ClosedSignal[]): ClosedSignal[] => {
   const seen = new Set<string>();
   const sanitized: ClosedSignal[] = [];
@@ -212,6 +217,61 @@ const sanitizeClosedSignals = (items: ClosedSignal[]): ClosedSignal[] => {
   }
   return sanitized;
 };
+
+/**
+ * Remove entries that represent the same trade (same symbol + direction
+ * + entry + exit + outcome), keeping only the first occurrence. This
+ * catches duplicates that came from the app writing once and a manual
+ * reconciliation script writing again with a different ID.
+ */
+const deduplicateByContent = (items: ClosedSignal[]): ClosedSignal[] => {
+  const seen = new Map<string, ClosedSignal>();
+  for (const item of items) {
+    const key = [
+      item.symbol,
+      item.direction,
+      Number(item.entryPrice).toFixed(4),
+      Number(item.exitPrice).toFixed(4),
+      item.outcome,
+    ].join('|');
+    if (!seen.has(key)) seen.set(key, item);
+  }
+  // Sort newest-first by timestamp
+  return Array.from(seen.values()).sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+};
+
+/**
+ * Format the closed-at time relative to today, computed from `timestamp`.
+ * Fixes the historical bug where every entry said "Today" forever because
+ * the app stored the literal string "Today, HH:MM" at write time.
+ */
+const formatClosedAt = (item: ClosedSignal): string => {
+  const ts = item.timestamp;
+  if (!ts) return item.closedAt || 'N/A';
+
+  const closeDate = new Date(ts);
+  const now = new Date();
+
+  const closeDay = new Date(closeDate.getFullYear(), closeDate.getMonth(), closeDate.getDate());
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const diffDays = Math.round((today.getTime() - closeDay.getTime()) / ONE_DAY);
+
+  const timeStr = closeDate.toLocaleTimeString([], {
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
+
+  if (diffDays === 0) return `Today, ${timeStr}`;
+  if (diffDays === 1) return `Yesterday, ${timeStr}`;
+  if (diffDays <= 6) return `${diffDays} Days Ago, ${timeStr}`;
+
+  const month = closeDate.toLocaleString('en-US', { month: 'short' });
+  const day = closeDate.getDate();
+  return `${month} ${day}, ${timeStr}`;
+};
+
+// ─────────────────────────────────────────────────────────────────────────
 
 export const TrackRecord: React.FC = () => {
   const [filterOutcome, setFilterOutcome] = useState<'all' | 'wins' | 'losses'>('all');
@@ -225,7 +285,10 @@ export const TrackRecord: React.FC = () => {
     if (saved !== null) {
       try {
         const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed)) return sanitizeClosedSignals(parsed);
+        if (Array.isArray(parsed)) {
+          // Sanitize → dedup-by-content → sort newest first
+          return deduplicateByContent(sanitizeClosedSignals(parsed));
+        }
       } catch {
         // fallback
       }
@@ -237,14 +300,16 @@ export const TrackRecord: React.FC = () => {
     localStorage.setItem('tradesignal_closed_signals_journal', JSON.stringify(signalsList));
   }, [signalsList]);
 
-  // Listen for realtime journal updates from App.tsx when running trades hit TP/SL or close
+  // Listen for realtime journal updates from App.tsx
   useEffect(() => {
     const handleJournalUpdate = () => {
       const saved = localStorage.getItem('tradesignal_closed_signals_journal');
       if (saved) {
         try {
           const parsed = JSON.parse(saved);
-          if (Array.isArray(parsed)) setSignalsList(sanitizeClosedSignals(parsed));
+          if (Array.isArray(parsed)) {
+            setSignalsList(deduplicateByContent(sanitizeClosedSignals(parsed)));
+          }
         } catch (e) {
           console.error(e);
         }
@@ -265,7 +330,7 @@ export const TrackRecord: React.FC = () => {
     const text = `📜 TRADESIGNAL CLOSED JOURNAL: ${item.symbol} (${item.direction})
 • Timeframe: ${item.timeframe.toUpperCase()}
 • Start Time: ${item.timeStart || 'N/A'}
-• Closed At: ${item.closedAt}
+• Closed At: ${formatClosedAt(item)}
 • Duration: ${item.duration || item.holdingTime}
 • Entry Price: $${item.entryPrice < 2 ? item.entryPrice.toFixed(4) : item.entryPrice.toLocaleString()}
 • Stop Loss: ${item.stopLoss ? `$${item.stopLoss < 2 ? item.stopLoss.toFixed(4) : item.stopLoss.toLocaleString()}` : 'N/A'}
@@ -278,7 +343,7 @@ export const TrackRecord: React.FC = () => {
     setTimeout(() => setCopiedId(null), 2000);
   };
 
-  // Handler: Archive completed records older than 5 days (120 hours)
+  // Archive records older than 5 days
   const handleArchiveOlderThan5Days = () => {
     const FIVE_DAYS_MS = 5 * 24 * 60 * 60 * 1000;
     const now = Date.now();
@@ -309,7 +374,6 @@ export const TrackRecord: React.FC = () => {
     });
   };
 
-  // Internal executor: purge journal state and storage
   const executeClearJournal = () => {
     const count = signalsList.length;
     setSignalsList([]);
@@ -321,11 +385,9 @@ export const TrackRecord: React.FC = () => {
     });
   };
 
-  // Handler: Clear all closed signals from journal with safe intent verification
   const handleClearJournal = () => {
     if (signalsList.length === 0) return;
 
-    // Detect if running in an iframe sandbox (where window.confirm is blocked by modern browsers)
     const isInsideIframe = typeof window !== 'undefined' && window.self !== window.top;
 
     if (!isInsideIframe) {
@@ -340,15 +402,13 @@ export const TrackRecord: React.FC = () => {
           return;
         }
       } catch {
-        // Fall through to interactive modal if window.confirm errors
+        // fall through
       }
     }
 
-    // Always open in-app modal if in an iframe or if window.confirm is suppressed
     setIsConfirmClearModalOpen(true);
   };
 
-  // Handler: Reset default records
   const handleResetSampleRecords = () => {
     setSignalsList(INITIAL_CLOSED_SIGNALS);
     localStorage.setItem('tradesignal_closed_signals_journal', JSON.stringify(INITIAL_CLOSED_SIGNALS));
@@ -358,7 +418,7 @@ export const TrackRecord: React.FC = () => {
     });
   };
 
-  // Dynamic performance statistics computed from active journal signals
+  // Dynamic performance statistics
   const stats = useMemo<PerformanceStats>(() => {
     if (signalsList.length === 0) {
       return {
@@ -415,7 +475,6 @@ export const TrackRecord: React.FC = () => {
     <div id="track-record-view" className="space-y-6">
       {/* Top Metrics Cards Grid */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
-        {/* Win Rate */}
         <div className="bg-slate-900/80 border border-slate-800 rounded-xl p-4">
           <div className="flex items-center justify-between text-xs text-slate-400 mb-1">
             <span>Overall Win Rate</span>
@@ -429,7 +488,6 @@ export const TrackRecord: React.FC = () => {
           </div>
         </div>
 
-        {/* Profit Factor */}
         <div className="bg-slate-900/80 border border-slate-800 rounded-xl p-4">
           <div className="flex items-center justify-between text-xs text-slate-400 mb-1">
             <span>Profit Factor</span>
@@ -443,7 +501,6 @@ export const TrackRecord: React.FC = () => {
           </div>
         </div>
 
-        {/* Net Profit */}
         <div className="bg-slate-900/80 border border-slate-800 rounded-xl p-4">
           <div className="flex items-center justify-between text-xs text-slate-400 mb-1">
             <span>Net Return (Verified)</span>
@@ -457,7 +514,6 @@ export const TrackRecord: React.FC = () => {
           </div>
         </div>
 
-        {/* Max Drawdown */}
         <div className="bg-slate-900/80 border border-slate-800 rounded-xl p-4">
           <div className="flex items-center justify-between text-xs text-slate-400 mb-1">
             <span>Max Drawdown</span>
@@ -472,7 +528,7 @@ export const TrackRecord: React.FC = () => {
         </div>
       </div>
 
-      {/* Asset Performance Breakdown Bar */}
+      {/* Asset Performance Breakdown */}
       <div className="bg-slate-900/80 border border-slate-800 rounded-xl p-4 sm:p-5">
         <h4 className="text-xs font-bold text-slate-300 uppercase tracking-wider mb-4 flex items-center gap-2">
           <PieChart className="w-4 h-4 text-emerald-400" />
@@ -520,7 +576,6 @@ export const TrackRecord: React.FC = () => {
           </div>
 
           <div className="flex flex-wrap items-center gap-2 w-full xl:w-auto">
-            {/* Archive > 5d Button */}
             <button
               id="journal-archive-btn"
               type="button"
@@ -532,7 +587,6 @@ export const TrackRecord: React.FC = () => {
               <span>Archive &gt; 5d</span>
             </button>
 
-            {/* Clear Log Button */}
             <button
               id="journal-clear-btn"
               type="button"
@@ -545,7 +599,6 @@ export const TrackRecord: React.FC = () => {
               <span>Clear Log</span>
             </button>
 
-            {/* Reset Sample Records button if records cleared or altered */}
             {signalsList.length < INITIAL_CLOSED_SIGNALS.length && (
               <button
                 id="journal-reset-sample-btn"
@@ -559,7 +612,6 @@ export const TrackRecord: React.FC = () => {
               </button>
             )}
 
-            {/* Filter pills */}
             <div className="flex bg-slate-950 p-0.5 rounded-lg border border-slate-800 text-xs">
               <button
                 type="button"
@@ -606,7 +658,7 @@ export const TrackRecord: React.FC = () => {
         {/* Action Feedback Banner */}
         {actionFeedback && (
           <div className={`px-4 py-2 text-xs flex items-center justify-between border-b transition-all ${
-            actionFeedback.type === 'success' 
+            actionFeedback.type === 'success'
               ? 'bg-emerald-950/40 border-emerald-800/50 text-emerald-300'
               : actionFeedback.type === 'warning'
               ? 'bg-rose-950/40 border-rose-800/50 text-rose-300'
@@ -618,7 +670,7 @@ export const TrackRecord: React.FC = () => {
               {actionFeedback.type === 'info' && <Archive className="w-3.5 h-3.5 text-blue-400" />}
               {actionFeedback.message}
             </span>
-            <button 
+            <button
               onClick={() => setActionFeedback(null)}
               className="text-slate-400 hover:text-white text-xs cursor-pointer font-bold px-1"
             >
@@ -681,7 +733,7 @@ export const TrackRecord: React.FC = () => {
                           <Clock className="w-3 h-3 text-amber-400/90 shrink-0" />
                           <span>{item.timeStart || 'N/A'}</span>
                         </div>
-                        <div className="text-[10px] text-slate-500 mt-0.5">{item.closedAt}</div>
+                        <div className="text-[10px] text-slate-500 mt-0.5">{formatClosedAt(item)}</div>
                       </td>
 
                       <td className="py-3 px-4 text-slate-300">
@@ -709,7 +761,7 @@ export const TrackRecord: React.FC = () => {
                           ) : (
                             <XCircle className="w-3.5 h-3.5 text-rose-400" />
                           )}
-                          {item.outcome === 'SL' ? 'Stop Loss' : item.outcome === 'MANUAL' ? 'Manual Close' : `${item.outcome} Reached`}
+                          {item.outcome === 'SL' ? 'Stop Loss' : item.outcome === 'MANUAL' ? 'Manual Close' : item.outcome === 'TIME_STOP' ? 'Time Stop' : `${item.outcome} Reached`}
                         </span>
                       </td>
 
@@ -768,9 +820,9 @@ export const TrackRecord: React.FC = () => {
         </div>
       </div>
 
-      {/* Confirmation Modal for Clearing Journal (Guarantees user verification in iframe & all browsers) */}
+      {/* Confirm Modal for Clearing Journal */}
       {isConfirmClearModalOpen && (
-        <div 
+        <div
           id="clear-journal-confirm-dialog"
           className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm animate-in fade-in duration-150"
           role="dialog"

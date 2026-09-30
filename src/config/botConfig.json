@@ -36,7 +36,7 @@
     "min_reward_risk_ratio": 2.5,
     "max_daily_drawdown_percent": 3.0,
     "enforce_stop_loss": true,
-    "dynamic_trailing_stop": true,
+    "dynamic_trailing_stop": false,
     "trailing_stop_activation_pnl_pct": 0.8,
     "trailing_stop_distance_pct": 0.3
   },

@@ -66,47 +66,30 @@ const MIN_CONFLUENCE_SCORE = 70;
 const MIN_KILLZONE_WEIGHT = 0.3;
 const SKIP_KILLZONE_DEFAULT = true;
 
-// $100 LIVE MODE: 2 concurrent max. At 20% margin each that's 40% total
-// exposure — leaves 60% headroom for adverse moves.
+// Weekend trading filter.
+const SKIP_WEEKENDS = true;
+
+// $100 LIVE MODE constants
 const MAX_ACTIVE_TRADES = 2;
-
-// $100 LIVE MODE: 1 position per direction. Prevents 2-3 correlated SLs
-// from blowing through the -10% kill switch on a single crypto dump.
 const MAX_SAME_DIRECTION = 1;
-
-// $100 LIVE MODE: 20% margin per trade (was 30%). On a $100 account this
-// is $20 margin per order — leaves room for adverse moves + fees.
 const MAX_MARGIN_USE_PCT = 20;
-
 const MAX_DAILY_LOSS_PCT = 10;
 const BALANCE_STALE_MS = 60_000;
 const BALANCE_REFRESH_MS = 20_000;
-
-// $100 LIVE MODE: 1-hour cooldown after SL. Today's log showed DOT entered
-// and stopped out 4 times in 3 hours — pure thrashing. 15min was too short.
 const COOLDOWN_AFTER_SL_MS = 60 * 60_000;
-
 const MAX_CONSECUTIVE_FAILURES = 3;
-
 const CANDLE_CLOSE_WINDOW_SEC = 30;
-
 const FUNDING_CROWDED_THRESHOLD = 0.0006;
 const FUNDING_CACHE_TTL_MS = 10 * 60_000;
-
-const USER_STREAM_KEEPALIVE_MS = 25 * 60_000; // 25 min (safe margin below Binance's 30-min limit)
-
-// Max acceptable price drift between scoring and execution.
-// Was hard-coded 0.4%, now 1.0% to account for the scan pipeline taking
-// 30-60s (AI timeouts + 3 candle fetches + funding per symbol).
+const USER_STREAM_KEEPALIVE_MS = 25 * 60_000;
 const MAX_ENTRY_DRIFT_PCT = 0.010;
 
-// Time stop: recycle dead 5m scalps after 30 minutes of no progress.
-// Only fires when PnL is between MIN and MAX (i.e., the trade is "flat").
-// Doesn't fire if the trade is already heading to SL (below -0.5%) or
-// already working (above +0.3%). Frees the symbol slot + margin.
 const TIME_STOP_MS = 30 * 60_000;
 const TIME_STOP_MIN_PNL = -0.5;
 const TIME_STOP_MAX_PNL = 0.3;
+
+// Signals array pruning: keep ACTIVE + last N CLOSED to prevent bloat.
+const SIGNALS_KEEP_CLOSED = 20;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // MARKET DATA WEBSOCKET — module-level singleton
@@ -120,17 +103,12 @@ let __marketWs: WebSocket | null = null;
 let __marketWsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let __marketWsUrlIndex = 0;
 
-// $100 LIVE MODE: only BTC/ETH/SOL. Highest liquidity = tightest spreads
-// = lowest fee drag. Smaller coins have tick sizes too large for $100 —
-// you'd get "qty rounds to 0" rejections or 15-30% slippage on fills.
 const SCAN_WHITELIST = new Set<string>([
   'BTC/USDT', 'ETH/USDT', 'SOL/USDT',
 ]);
 
 // ═══════════════════════════════════════════════════════════════════════════
-// DEBUG BRIDGE — exposes pure scoring functions on window so the browser
-// console can call them directly (import() is blocked by AI Studio's CSP).
-// Read-only; does not affect production behavior.
+// DEBUG BRIDGE
 // ═══════════════════════════════════════════════════════════════════════════
 if (typeof window !== 'undefined') {
   (window as any).__signalEngine = {
@@ -339,7 +317,6 @@ export const App: React.FC = () => {
 
   const [accountSnapshot, setAccountSnapshot] = useState<AccountSnapshot | null>(null);
 
-  // Orphan positions detected on Binance at startup
   const [orphanPositions, setOrphanPositions] = useState<OrphanPosition[]>([]);
   const [orphanBannerDismissed, setOrphanBannerDismissed] = useState<boolean>(false);
 
@@ -415,9 +392,6 @@ export const App: React.FC = () => {
     fetchedAt: 0,
   });
 
-  // $100 LIVE MODE: per-symbol daily entry counter. Prevents the bot from
-  // re-entering the same symbol over and over in chop. Key = "YYYY-MM-DD|SYMBOL",
-  // value = count of entries today. Max 2 entries per symbol per UTC day.
   const dailyEntryCountRef = useRef<Record<string, number>>({});
   const MAX_ENTRIES_PER_SYMBOL_PER_DAY = 2;
 
@@ -448,11 +422,6 @@ export const App: React.FC = () => {
   useEffect(() => { accountSnapshotRef.current = accountSnapshot; }, [accountSnapshot]);
   useEffect(() => { apiSettingsRef.current = apiSettings; }, [apiSettings]);
 
-  // ─────────────────────────────────────────────────────────────────────
-  // signalsRef-syncing helpers. These are the SINGLE source of truth for
-  // any state mutation on the `signals` list that must be visible to
-  // asynchronous code (scan loop, WS handlers) on the SAME tick.
-  // ─────────────────────────────────────────────────────────────────────
   const addSignals = (incoming: TradeSignal[]) => {
     setSignals((prev) => [...prev, ...incoming]);
     signalsRef.current = [...signalsRef.current, ...incoming];
@@ -466,6 +435,16 @@ export const App: React.FC = () => {
   const patchSignal = (id: string, patch: Partial<TradeSignal>) => {
     setSignals((prev) => prev.map((s) => (s.id === id ? { ...s, ...patch } : s)));
     signalsRef.current = signalsRef.current.map((s) => (s.id === id ? { ...s, ...patch } : s));
+  };
+
+  // Prune signals: keep ACTIVE + most recent N CLOSED, drop the rest.
+  const pruneSignals = (arr: TradeSignal[]): TradeSignal[] => {
+    const active = arr.filter((s) => s.status === 'ACTIVE');
+    const closed = arr
+      .filter((s) => s.status !== 'ACTIVE')
+      .sort((a, b) => (b.closedAt || b.createdAt || 0) - (a.closedAt || a.createdAt || 0))
+      .slice(0, SIGNALS_KEEP_CLOSED);
+    return [...active, ...closed];
   };
 
   const loadExchangeInfo = async (): Promise<void> => {
@@ -555,7 +534,6 @@ export const App: React.FC = () => {
     } catch { return 0; }
   };
 
-  // Returns ALL open positions from Binance, for orphan detection.
   const getAllOpenPositions = async (): Promise<OrphanPosition[]> => {
     if (!apiSettings.apiKey || !apiSettings.apiSecret || !apiSettings.enableFutures) return [];
     const baseUrl = getBaseUrl(apiSettings.environment, true);
@@ -584,7 +562,60 @@ export const App: React.FC = () => {
     } catch { return []; }
   };
 
-  // Closes a single orphan position via reduceOnly MARKET order.
+  // Fetch the actual trigger price of the SL algo order on Binance for a symbol.
+  const fetchActualSlTrigger = async (binanceSym: string): Promise<number | null> => {
+    if (!apiSettings.apiKey || !apiSettings.apiSecret) return null;
+    const baseUrl = getBaseUrl(apiSettings.environment, true);
+    const qs = `symbol=${binanceSym}&timestamp=${Date.now()}&recvWindow=10000`;
+    let sig: string;
+    try { sig = await generateSignature(qs, apiSettings.apiSecret); }
+    catch { return null; }
+    const url = getCorsProxyUrl(`${baseUrl}/fapi/v1/openAlgoOrders?${qs}&signature=${sig}`);
+    try {
+      const res = await fetch(url, {
+        headers: { 'X-MBX-APIKEY': apiSettings.apiKey, 'Content-Type': 'application/json' },
+      });
+      if (!res.ok) return null;
+      const data = await res.json();
+      if (!Array.isArray(data)) return null;
+      const slOrder = data.find((o: any) =>
+        o.orderType === 'STOP_MARKET' || o.type === 'STOP_MARKET' ||
+        o.algoType === 'STOP_MARKET' ||
+        (String(o.type || o.orderType || '').toUpperCase().includes('STOP'))
+      );
+      if (!slOrder) return null;
+      const trigger = parseFloat(
+        slOrder.triggerPrice ?? slOrder.stopPrice ?? slOrder.tp ?? '0'
+      );
+      return Number.isFinite(trigger) && trigger > 0 ? trigger : null;
+    } catch { return null; }
+  };
+
+  // Fetch last fill price for a symbol (used by reconciliation).
+  const fetchLastFillPrice = async (
+    binanceSym: string,
+  ): Promise<{ price: number; time: number } | null> => {
+    if (!apiSettings.apiKey || !apiSettings.apiSecret) return null;
+    const baseUrl = getBaseUrl(apiSettings.environment, true);
+    const qs = `symbol=${binanceSym}&limit=5&timestamp=${Date.now()}&recvWindow=10000`;
+    let sig: string;
+    try { sig = await generateSignature(qs, apiSettings.apiSecret); }
+    catch { return null; }
+    const url = getCorsProxyUrl(`${baseUrl}/fapi/v1/userTrades?${qs}&signature=${sig}`);
+    try {
+      const res = await fetch(url, {
+        headers: { 'X-MBX-APIKEY': apiSettings.apiKey, 'Content-Type': 'application/json' },
+      });
+      if (!res.ok) return null;
+      const data = await res.json();
+      if (!Array.isArray(data) || data.length === 0) return null;
+      const last = data[data.length - 1];
+      const price = parseFloat(last.price);
+      if (!Number.isFinite(price) || price <= 0) return null;
+      return { price, time: last.time };
+    } catch { return null; }
+  };
+
   const closeOrphanPosition = async (orphan: OrphanPosition): Promise<{ success: boolean; orderId?: string; error?: string }> => {
     const isFutures = apiSettings.enableFutures;
     const baseUrl = getBaseUrl(apiSettings.environment, isFutures);
@@ -727,7 +758,6 @@ export const App: React.FC = () => {
       const today = new Date().toISOString().slice(0, 10);
       if (dailyPnlRef.current.day !== today) {
         dailyPnlRef.current = { day: today, pnl: 0 };
-        // $100 LIVE MODE: also clear the per-symbol daily entry counter.
         dailyEntryCountRef.current = {};
         console.log(`[DAY-ROLLOVER] Daily PnL + per-symbol entry counts reset for ${today}`);
       }
@@ -1029,9 +1059,6 @@ export const App: React.FC = () => {
       }
     };
 
-    // Pre-check margin type via positionRisk, then POST only if needed.
-    // Binance returns -4046 (HTTP 400) when the symbol is already isolated.
-    // Reading positionRisk first means the POST is never made unnecessarily.
     const setMarginTypeIsolated = async (s: string): Promise<boolean> => {
       const preQs = `symbol=${s}&timestamp=${Date.now()}&recvWindow=10000`;
       let preSig: string;
@@ -1240,10 +1267,7 @@ export const App: React.FC = () => {
   };
 
   // ═════════════════════════════════════════════════════════════════════════
-  // USER DATA STREAM — listens for ALGO_UPDATE (SL/TP fills) and ORDER_TRADE_UPDATE
-  // Side effects (journal write, Telegram, daily PnL, kill switch) are kept
-  // OUTSIDE the setSignals() updater so React StrictMode's double-invocation
-  // of the updater cannot duplicate them.
+  // USER DATA STREAM
   // ═════════════════════════════════════════════════════════════════════════
   useEffect(() => {
     if (!apiSettings.apiKey || !apiSettings.enableFutures) return;
@@ -1267,9 +1291,6 @@ export const App: React.FC = () => {
         try {
           const payload = JSON.parse(event.data);
 
-          // ─────────────────────────────────────────────────────────────
-          // ALGO_UPDATE — SL or TP on the exchange fired.
-          // ─────────────────────────────────────────────────────────────
           if (payload.e === 'ALGO_UPDATE') {
             const o = payload.o ?? {};
             const rawSymbol = o.s ?? o.symbol;
@@ -1283,7 +1304,6 @@ export const App: React.FC = () => {
 
             const symbolFormatted = `${rawSymbol.replace(/USDT$/, '')}/USDT`;
 
-            // Locate target trade OUTSIDE the updater
             const target = signalsRef.current.find((sig) => {
               if (sig.symbol !== symbolFormatted) return false;
               if (sig.status !== 'ACTIVE') return false;
@@ -1300,7 +1320,6 @@ export const App: React.FC = () => {
             const outcome: ClosedOutcome = isSlFill ? 'SL' : 'TP1';
             const pnlPct = Number(rawPnl.toFixed(2));
 
-            // ── Side effects ONCE, outside any updater ──
             markClosedHandled(target.id);
             recordClosedSignalToJournal(target, exitP, outcome, pnlPct);
             alertTradeClosed({
@@ -1320,7 +1339,6 @@ export const App: React.FC = () => {
               tripKillSwitch(`Daily loss ${dailyPnlRef.current.pnl.toFixed(2)}% hit -${MAX_DAILY_LOSS_PCT}%`);
             }
 
-            // ── Pure state update ──
             const closedTrade: Partial<TradeSignal> = {
               currentPrice: exitP,
               pnlPercentage: pnlPct,
@@ -1333,9 +1351,6 @@ export const App: React.FC = () => {
             return;
           }
 
-          // ─────────────────────────────────────────────────────────────
-          // ORDER_TRADE_UPDATE — entry fill price reconciliation.
-          // ─────────────────────────────────────────────────────────────
           if (payload.e !== 'ORDER_TRADE_UPDATE') return;
           const o = payload.o ?? {};
           const rawSymbol = o.s ?? o.symbol;
@@ -1369,7 +1384,6 @@ export const App: React.FC = () => {
         }
       };
 
-      // Keep-alive: 25 min, with failure tracking → forced reconnect after 2 failures.
       keepAliveInterval = setInterval(async () => {
         if (!currentListenKey) return;
         const ok = await keepAliveListenKey(currentListenKey);
@@ -1499,7 +1513,8 @@ export const App: React.FC = () => {
       const startStr = `${formatStartTime(startTimeMs)} UTC`;
       const now = Date.now();
       const suffix = Math.random().toString(36).substring(2, 6);
-      const closedAtStr = `Today, ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false })}`;
+      // ✅ FIX: store ISO string so the display layer can format relative dates.
+      const closedAtStr = new Date(now).toISOString();
       const pnlPipsOrPoints = Number(Math.abs(exitPrice - trade.entryPrice).toFixed(4));
       const newRecord: ClosedSignal = {
         id: `CS-${trade.symbol.replace(/[^A-Z0-9]/g, '')}-${now}-${suffix}`,
@@ -1512,6 +1527,7 @@ export const App: React.FC = () => {
       const saved = localStorage.getItem('tradesignal_closed_signals_journal');
       let current: ClosedSignal[] = [];
       if (saved) { try { const parsed = JSON.parse(saved); if (Array.isArray(parsed)) current = parsed; } catch { current = []; } }
+      // Dedup by id when merging.
       const seen = new Set<string>();
       const merged: ClosedSignal[] = [];
       for (const item of [newRecord, ...current]) {
@@ -1574,8 +1590,16 @@ ${items.join('\n\n')}
     if (!currentAssets.length) return;
     if (isScanningRef.current) return;
 
-    // skipKillZone=true  → bypass the gate entirely (test mode)
-    // skipKillZone=false → enforce zone weight ≥ MIN_KILLZONE_WEIGHT
+    if (SKIP_WEEKENDS) {
+      const dow = new Date().getUTCDay();
+      if (dow === 0 || dow === 6) {
+        const dayName = dow === 0 ? 'Sunday' : 'Saturday';
+        console.log(`[WEEKEND] ${dayName} UTC — new entries blocked. Existing trades unaffected.`);
+        setConnectionLog(`⏸ Weekend (${dayName} UTC) — no new entries. Existing trades run their SL/TP.`);
+        return;
+      }
+    }
+
     const zone = isInKillZone();
     if (!skipKillZone && zone.weight < MIN_KILLZONE_WEIGHT) {
       setConnectionLog(`⏸ Outside high-weight kill zones (${zone.name}, w=${zone.weight}) — skipped.`);
@@ -1585,7 +1609,6 @@ ${items.join('\n\n')}
     const today = new Date().toISOString().slice(0, 10);
     if (dailyPnlRef.current.day !== today) dailyPnlRef.current = { day: today, pnl: 0 };
 
-    // Only pause on real drawdown (negative), never on winning days.
     if (dailyPnlRef.current.pnl <= -botConfig.risk_engine.max_daily_drawdown_percent) {
       setConnectionLog(
         `🛑 Daily drawdown limit reached (${dailyPnlRef.current.pnl.toFixed(2)}% ≤ -${botConfig.risk_engine.max_daily_drawdown_percent}%) — paused.`
@@ -1649,7 +1672,6 @@ ${items.join('\n\n')}
         return Date.now() - lastSL >= COOLDOWN_AFTER_SL_MS;
       });
 
-    // Surface AI-unavailable to the UI once at scan start.
     if (aiValidatorEnabled && !isAiValidatorConfigured()) {
       setConnectionLog(
         '⚠️ AI Validator is ON but no Gemini key is loaded — falling back to rules-only. ' +
@@ -1673,8 +1695,6 @@ ${items.join('\n\n')}
       if (newPositions.length >= slots) break;
       if (error || candles.length < 30) continue;
 
-      // $100 LIVE MODE: per-symbol daily entry cap. Prevents DOT-style
-      // thrashing where the bot re-enters the same symbol after each SL.
       const todayKey = `${new Date().toISOString().slice(0, 10)}|${asset.symbol}`;
       const todayCount = dailyEntryCountRef.current[todayKey] ?? 0;
       if (todayCount >= MAX_ENTRIES_PER_SYMBOL_PER_DAY) {
@@ -1688,7 +1708,6 @@ ${items.join('\n\n')}
       const confluence = scoreConfluence(candles);
       console.log(`[SCAN] ${asset.symbol}: 5m score=${confluence.total.toFixed(0)} dir=${confluence.direction} | ${confluence.reasons.join(', ')}`);
 
-      // SHORT-WATCH: near-miss short setups (score 50-69 with bearish reasons).
       if (confluence.total >= 50 && confluence.total < MIN_CONFLUENCE_SCORE) {
         const shortLeaning = confluence.reasons.some((r) => {
           const lower = r.toLowerCase();
@@ -1714,8 +1733,6 @@ ${items.join('\n\n')}
       const trend15m = scoreConfluence(candles15m);
       console.log(`[SCAN] ${asset.symbol}: 15m score=${trend15m.total.toFixed(0)} dir=${trend15m.direction}`);
 
-      // SHORT-CANDIDATE: 5m is SHORT but 15m disagrees. The 15m gate below
-      // will reject it — this log makes the rejection visible/explainable.
       if (confluence.direction === 'SHORT' && trend15m.direction !== 'SHORT') {
         console.log(
           `[SCAN] ${asset.symbol}: [SHORT-CANDIDATE] 5m=${confluence.total.toFixed(0)} SHORT, ` +
@@ -1767,8 +1784,6 @@ ${items.join('\n\n')}
       let aiMultiplier = 1.0;
       let aiReasoning = '';
 
-      // Short-circuit when AI is enabled but no key is loaded, so we don't
-      // burn 6 seconds per setup on a request that will just time out.
       const aiCanRun = aiValidatorEnabled && isAiValidatorConfigured();
       if (aiValidatorEnabled && !isAiValidatorConfigured()) {
         console.log(
@@ -1875,7 +1890,6 @@ ${items.join('\n\n')}
       busySymbols.add(asset.symbol);
     }
 
-    // Diagnostic summary so the console shows exactly what qualified.
     console.log(
       `[SCAN] Evaluation complete. Qualified setups: ${newPositions.length} ` +
       `(longsQueued=${longsQueued}, shortsQueued=${shortsQueued}, slots=${slots})`
@@ -1886,7 +1900,6 @@ ${items.join('\n\n')}
       setIsScanning(false); return;
     }
 
-    // Synchronous state + ref update — subsequent awaits can rely on the ref.
     addSignals(newPositions);
 
     for (const pos of newPositions) {
@@ -2005,7 +2018,6 @@ ${items.join('\n\n')}
         environment: apiSettings.environment, usdtBalance: liveSnapshot.availableBalance,
       });
 
-      // $100 LIVE MODE: increment per-symbol daily counter after success.
       const todayKey = `${new Date().toISOString().slice(0, 10)}|${pos.symbol}`;
       dailyEntryCountRef.current[todayKey] = (dailyEntryCountRef.current[todayKey] ?? 0) + 1;
       console.log(
@@ -2031,15 +2043,12 @@ ${items.join('\n\n')}
   useEffect(() => { scanFnRef.current = handleExecuteCryptoScalpScan; });
 
   // ═════════════════════════════════════════════════════════════════════════
-  // ORPHAN RESCUE — runs once when API keys become available.
-  //
-  // SAFETY PATCHES (redeploy proof):
-  //   1. Waits 5s after mount so React has time to hydrate `signals` from
-  //      localStorage before comparing against Binance. Prevents false-
-  //      positive orphan flagging right after a redeploy.
-  //   2. Logs the tracked set AND the Binance set so we can diagnose.
-  //   3. If ALL Binance positions are unknown, warns loudly — that's a
-  //      redeploy-wiped-localStorage signature, NOT normal orphans.
+  // STARTUP JOBS — Run once per app load, in sequence:
+  //   1. Prune signals array (housekeeping)           — instant
+  //   2. Wait 5s for React hydration
+  //   3. Orphan detection (Binance positions not in app)
+  //   4. SL repair (fix corrupted SL for active trades)
+  //   5. Phantom reconciliation (close signals not on Binance)
   // ═════════════════════════════════════════════════════════════════════════
   const orphanCheckRanRef = useRef(false);
   useEffect(() => {
@@ -2049,73 +2058,165 @@ ${items.join('\n\n')}
 
     (async () => {
       try {
-        // Wait 5 seconds after mount so `signals` has settled from
-        // localStorage before we compare against Binance. Without this,
-        // a slow localStorage read + fast Binance call can flag our own
-        // freshly-opened trades as orphans after a redeploy.
+        // ── JOB 1: Prune signals array (housekeeping) ──
+        const beforePrune = signalsRef.current.length;
+        const pruned = pruneSignals(signalsRef.current);
+        if (pruned.length !== beforePrune) {
+          setSignals(pruned);
+          signalsRef.current = pruned;
+          console.log(`[PRUNE] signals: ${beforePrune} → ${pruned.length}`);
+        }
+
+        // Wait 5s for hydration
         await new Promise((r) => setTimeout(r, 5000));
 
+        // ── JOB 2: Orphan detection ──
         const open = await getAllOpenPositions();
         if (open.length === 0) {
           console.log('[orphan] no open positions on Binance');
           setOrphanPositions([]);
+        } else {
+          const trackedSymbols = new Set(
+            signalsRef.current
+              .filter((s) => s.status === 'ACTIVE')
+              .map((s) => s.symbol.replace('/', '').toUpperCase()),
+          );
+
+          console.log(
+            `[orphan] tracked (from signals): [${Array.from(trackedSymbols).join(', ') || '(empty)'}]`
+          );
+          console.log(
+            `[orphan] on Binance: [${open.map((p) => p.symbol).join(', ')}]`
+          );
+
+          const orphans = open.filter((p) => !trackedSymbols.has(p.symbol));
+          setOrphanPositions(orphans);
+
+          if (orphans.length > 0) {
+            const list = orphans
+              .map((p) => `${p.symbol} ${p.positionAmt > 0 ? 'LONG' : 'SHORT'} ${Math.abs(p.positionAmt).toFixed(4)}`)
+              .join(' | ');
+            const allAreOrphans = orphans.length === open.length;
+            const warning = allAreOrphans
+              ? `⚠️ ALL ${open.length} BINANCE POSITIONS are unknown to this session. ` +
+                `This usually means localStorage was cleared by a redeploy. ` +
+                `CHECK before closing — these may be YOUR trades.`
+              : `⚠️ ORPHAN POSITIONS (${orphans.length}): ${list}.`;
+            setConnectionLog(`${warning} Positions: ${list}.`);
+            console.warn('[orphan] WARNING:', warning);
+          } else {
+            console.log('[orphan] all Binance positions are tracked in this session ✅');
+          }
+        }
+
+        // ── JOB 3: SL repair ──
+        const activeWithNativeSl = signalsRef.current.filter((s) =>
+          s.status === 'ACTIVE' &&
+          s.binanceSlOrderId &&
+          s.binanceTpOrderId
+        );
+        if (activeWithNativeSl.length > 0) {
+          console.log(`[SL-REPAIR] checking ${activeWithNativeSl.length} active trade(s) with native SL`);
+          for (const sig of activeWithNativeSl) {
+            try {
+              const sym = sig.symbol.replace('/', '').toUpperCase();
+              const realSL = await fetchActualSlTrigger(sym);
+              if (realSL === null) {
+                console.warn(`[SL-REPAIR] ${sig.symbol}: could not fetch real SL from Binance`);
+                continue;
+              }
+              const oldSL = sig.stopLoss;
+              if (Math.abs(realSL - oldSL) > 0.0001) {
+                console.log(
+                  `[SL-REPAIR] ${sig.symbol}: SL was $${oldSL} → corrected to $${realSL} (actual Binance trigger)`
+                );
+                patchSignal(sig.id, { stopLoss: realSL });
+              } else {
+                console.log(`[SL-REPAIR] ${sig.symbol}: SL already correct at $${realSL}`);
+              }
+            } catch (err: any) {
+              console.warn(`[SL-REPAIR] ${sig.symbol}: failed — ${err.message}`);
+            }
+          }
+        }
+
+        // ── JOB 4: Phantom reconciliation ──
+        // Any ACTIVE signal whose symbol is not on Binance's position list
+        // is a phantom — close it locally and journal the real exit.
+        const openPositions = await getAllOpenPositions();
+        const openSymbols = new Set(openPositions.map((p) => p.symbol));
+
+        const activeSignals = signalsRef.current.filter((s) => s.status === 'ACTIVE');
+        if (activeSignals.length === 0) {
           return;
         }
 
-        const trackedSymbols = new Set(
-          signalsRef.current
-            .filter((s) => s.status === 'ACTIVE')
-            .map((s) => s.symbol.replace('/', '').toUpperCase()),
-        );
+        console.log(`[RECONCILE] checking ${activeSignals.length} active signal(s) against Binance`);
+        let fixedCount = 0;
 
-        // Diagnostic logging — lets us see exactly what we're comparing.
-        console.log(
-          `[orphan] tracked (from signals): [${Array.from(trackedSymbols).join(', ') || '(empty)'}]`
-        );
-        console.log(
-          `[orphan] on Binance: [${open.map((p) => p.symbol).join(', ')}]`
-        );
+        for (const sig of activeSignals) {
+          const binanceSym = sig.symbol.replace('/', '').toUpperCase();
+          if (openSymbols.has(binanceSym)) continue;
 
-        const orphans = open.filter((p) => !trackedSymbols.has(p.symbol));
+          // Phantom — position not on Binance. Try to fetch actual exit price.
+          let exitPrice = sig.currentPrice || sig.entryPrice;
+          let pnlPct = sig.pnlPercentage || 0;
 
-        console.log(
-          `[orphan] Binance has ${open.length} open position(s): ` +
-          open.map((p) => `${p.symbol}(${p.positionAmt})`).join(', ')
-        );
+          try {
+            const lastFill = await fetchLastFillPrice(binanceSym);
+            if (lastFill) {
+              exitPrice = lastFill.price;
+              const isLong = sig.direction.includes('BUY');
+              const rawPnl = isLong
+                ? ((exitPrice - sig.entryPrice) / sig.entryPrice) * 100
+                : ((sig.entryPrice - exitPrice) / sig.entryPrice) * 100;
+              pnlPct = Number(rawPnl.toFixed(2));
+            }
+          } catch { /* use fallback */ }
 
-        setOrphanPositions(orphans);
+          const outcome: ClosedOutcome =
+            pnlPct > 0.5 ? 'TP1'
+            : pnlPct < -0.5 ? 'SL'
+            : 'MANUAL';
 
-        if (orphans.length > 0) {
-          const list = orphans
-            .map((p) => `${p.symbol} ${p.positionAmt > 0 ? 'LONG' : 'SHORT'} ${Math.abs(p.positionAmt).toFixed(4)}`)
-            .join(' | ');
+          console.log(
+            `[RECONCILE] ${sig.symbol}: NOT on Binance → marking CLOSED ` +
+            `(exit $${exitPrice}, pnl ${pnlPct}%, outcome ${outcome})`
+          );
 
-          // If every Binance position is unknown, this is likely a redeploy
-          // that wiped localStorage — NOT a stale-orphan situation. Warn hard.
-          const allAreOrphans = orphans.length === open.length;
-          const warning = allAreOrphans
-            ? `⚠️ ALL ${open.length} BINANCE POSITIONS are unknown to this session. ` +
-              `This usually means localStorage was cleared by a redeploy. ` +
-              `CHECK before closing — these may be YOUR trades.`
-            : `⚠️ ORPHAN POSITIONS (${orphans.length}): ${list}.`;
+          markClosedHandled(sig.id);
+          recordClosedSignalToJournal(sig, exitPrice, outcome, pnlPct);
+          alertTradeClosed({
+            symbol: sig.symbol, direction: sig.direction,
+            entryPrice: sig.entryPrice, exitPrice,
+            pnlPercentage: pnlPct, outcome,
+            duration: formatDuration(sig.startTime || Date.now()),
+            environment: apiSettings.environment,
+          });
 
-          setConnectionLog(`${warning} Positions: ${list}.`);
-          console.warn('[orphan] WARNING:', warning);
-          console.warn('[orphan] ORPHANS:', orphans.map((p) => p.symbol));
+          patchSignal(sig.id, {
+            status: 'CLOSED',
+            outcome,
+            closedAt: Date.now(),
+            currentPrice: exitPrice,
+            pnlPercentage: pnlPct,
+          });
+
+          fixedCount++;
+        }
+
+        if (fixedCount > 0) {
+          console.log(`[RECONCILE] ✅ Reconciled ${fixedCount} phantom trade(s)`);
         } else {
-          console.log('[orphan] all Binance positions are tracked in this session ✅');
+          console.log('[RECONCILE] all active signals verified on Binance ✅');
         }
       } catch (err: any) {
-        console.warn('[orphan] check failed:', err.message);
+        console.warn('[startup-jobs] failed:', err.message);
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [apiSettings.apiKey, apiSettings.apiSecret, apiSettings.enableFutures]);
 
-  // Closes every orphan via reduceOnly MARKET orders, one-by-one.
-  // SAFETY: requires an explicit window.confirm() listing every position
-  // before it fires. Prevents accidental closing of legit trades after a
-  // redeploy wiped the local `signals` state.
   const [isClosingOrphans, setIsClosingOrphans] = useState<boolean>(false);
   const handleCloseAllOrphans = async () => {
     if (isClosingOrphans || orphanPositions.length === 0) return;
@@ -2152,7 +2253,6 @@ ${items.join('\n\n')}
       await new Promise((res) => setTimeout(res, 300));
     }
 
-    // Re-read positions after closing
     await new Promise((res) => setTimeout(res, 1500));
     const after = await getAllOpenPositions();
     const trackedSymbols = new Set(
@@ -2176,9 +2276,6 @@ ${items.join('\n\n')}
 
   // ═════════════════════════════════════════════════════════════════════════
   // REDUCE-ONLY CLOSER
-  // Runs when the user manually closes a trade. Skips:
-  //   (a) trades already marked as handled (via markClosedHandled),
-  //   (b) trades that were already closed by the exchange via algo SL/TP.
   // ═════════════════════════════════════════════════════════════════════════
   useEffect(() => {
     if (!apiSettings.apiKey || !apiSettings.apiSecret) return;
@@ -2187,10 +2284,8 @@ ${items.join('\n\n')}
     );
     if (!justClosed.length) return;
     justClosed.forEach(async (trade) => {
-      // Mark synchronously, BEFORE any async work — this is our dedup gate.
       markClosedHandled(trade.id);
 
-      // If Binance already owns the exit via algo SL/TP, do NOT send reduceOnly.
       if (trade.binanceSlOrderId || trade.binanceTpOrderId) {
         console.log(`[CLOSE] ${trade.symbol} has algo SL/TP on exchange — skipping reduceOnly`);
         return;
@@ -2223,11 +2318,7 @@ ${items.join('\n\n')}
   }, [signals, apiSettings.apiKey, apiSettings.apiSecret]);
 
   // ═════════════════════════════════════════════════════════════════════════
-  // TIME STOP — every 60s, look for stale 5m scalps that aren't working.
-  // Closes them via market order (cancelling algo stops first) so the symbol
-  // slot and margin return to the pool. Only fires for trades whose PnL sits
-  // between TIME_STOP_MIN_PNL and TIME_STOP_MAX_PNL — anything trending toward
-  // SL or already profitable is left alone to hit its own exit.
+  // TIME STOP
   // ═════════════════════════════════════════════════════════════════════════
   useEffect(() => {
     if (!apiSettings.apiKey || !apiSettings.apiSecret || !apiSettings.enableFutures) return;
@@ -2255,7 +2346,6 @@ ${items.join('\n\n')}
           `[TIME-STOP] ${trade.symbol} — ${ageMin}m old, pnl=${pnl}% — closing`
         );
 
-        // 1) Cancel algo orders on Binance (if any) so nothing dangles.
         if (trade.binanceSlOrderId || trade.binanceTpOrderId) {
           try {
             const sym = trade.symbol.replace('/', '').toUpperCase();
@@ -2265,7 +2355,6 @@ ${items.join('\n\n')}
           }
         }
 
-        // 2) Market close via reduceOnly.
         const balance = accountSnapshotRef.current?.availableBalance ?? 0;
         if (balance > 0) {
           const dist = Math.abs(trade.entryPrice - trade.stopLoss);
@@ -2286,10 +2375,8 @@ ${items.join('\n\n')}
           }
         }
 
-        // 3) Mark handled (so reduce-only effect skips it).
         markClosedHandled(trade.id);
 
-        // 4) Journal + Telegram.
         const exit = trade.currentPrice || trade.entryPrice;
         recordClosedSignalToJournal(trade, exit, 'TIME_STOP', pnl);
         alertTradeClosed({
@@ -2300,7 +2387,6 @@ ${items.join('\n\n')}
           environment: apiSettings.environment,
         });
 
-        // 5) Update state (both React and ref).
         patchSignal(trade.id, {
           status: 'CLOSED',
           outcome: 'TIME_STOP',
@@ -2326,9 +2412,7 @@ ${items.join('\n\n')}
   }, [isAutoPilotActive]);
 
   // ═════════════════════════════════════════════════════════════════════════
-  // MARKET DATA STREAM — miniTicker feed for prices + app-managed SL/TP fallback
-  // Same two-phase pattern: compute closures outside the updater, then run
-  // side effects once, then apply a pure state update.
+  // MARKET DATA STREAM
   // ═════════════════════════════════════════════════════════════════════════
   useEffect(() => {
     let cancelled = false;
@@ -2342,7 +2426,6 @@ ${items.join('\n\n')}
         const rawData = JSON.parse(event.data);
         if (!Array.isArray(rawData)) return;
 
-        // ── Phase 1: pure asset update ──
         setAssets((prev) => {
           const updated = [...prev];
           rawData.forEach((item: any) => {
@@ -2365,7 +2448,6 @@ ${items.join('\n\n')}
           return updated;
         });
 
-        // ── Phase 2: build a priceMap OUTSIDE any updater ──
         const priceMap = new Map<string, number>();
         for (const item of rawData) {
           if (item?.s?.endsWith('USDT')) {
@@ -2375,7 +2457,6 @@ ${items.join('\n\n')}
           }
         }
 
-        // ── Phase 3: compute closures (pure read of signalsRef) ──
         type Closure = { sig: TradeSignal; livePrice: number; outcome: ClosedOutcome; rawPnl: number };
         const closures: Closure[] = [];
         const trailingStopUpdates = new Map<string, number>();
@@ -2390,9 +2471,11 @@ ${items.join('\n\n')}
             ? ((livePrice - sig.entryPrice) / (sig.entryPrice || 1)) * 100
             : ((sig.entryPrice - livePrice) / (sig.entryPrice || 1)) * 100;
 
-          // Trailing stop calculation (pure)
+          // TRAILING FIX: skip when Binance holds a native algo SL.
+          const hasNativeStopHere = Boolean(sig.binanceSlOrderId && sig.binanceTpOrderId);
           let sl = sig.stopLoss;
-          if (botConfig.risk_engine.dynamic_trailing_stop &&
+          if (!hasNativeStopHere &&
+              botConfig.risk_engine.dynamic_trailing_stop &&
               rawPnl >= botConfig.risk_engine.trailing_stop_activation_pnl_pct) {
             const trail = botConfig.risk_engine.trailing_stop_distance_pct / 100;
             if (isLong) {
@@ -2405,9 +2488,7 @@ ${items.join('\n\n')}
           }
           if (sl !== sig.stopLoss) trailingStopUpdates.set(sig.id, sl);
 
-          // Native stops on the exchange take priority — never close app-side.
-          const hasNativeStops = Boolean(sig.binanceSlOrderId && sig.binanceTpOrderId);
-          if (hasNativeStops) continue;
+          if (hasNativeStopHere) continue;
 
           let isSL = false, isTP = false;
           if (isLong) {
@@ -2424,7 +2505,6 @@ ${items.join('\n\n')}
           }
         }
 
-        // ── Phase 4: side effects ONCE ──
         for (const { sig, livePrice, outcome, rawPnl } of closures) {
           const pnlPct = Number(rawPnl.toFixed(2));
           markClosedHandled(sig.id);
@@ -2447,7 +2527,6 @@ ${items.join('\n\n')}
           tripKillSwitch(`Daily loss ${dailyPnlRef.current.pnl.toFixed(2)}% ≤ -${MAX_DAILY_LOSS_PCT}%`);
         }
 
-        // ── Phase 5: pure state update ──
         const closedMap = new Map<string, Closure>();
         for (const c of closures) closedMap.set(c.sig.id, c);
 
@@ -2479,7 +2558,6 @@ ${items.join('\n\n')}
           return { ...sig, currentPrice: livePrice, stopLoss, pnlPercentage: Number(rawPnl.toFixed(2)) };
         }));
 
-        // Mirror to ref so the next tick sees the same state synchronously.
         signalsRef.current = signalsRef.current.map((sig) => {
           if (sig.status !== 'ACTIVE') return sig;
           const livePrice = priceMap.get(sig.symbol);
@@ -2621,7 +2699,6 @@ ${items.join('\n\n')}
         </div>
       )}
 
-      {/* Orphan positions banner */}
       {orphanPositions.length > 0 && !orphanBannerDismissed && (
         <div className="bg-amber-600/20 border-b-2 border-amber-500 px-4 py-2 text-[12px] font-mono text-amber-100 flex items-center justify-between gap-3">
           <div className="flex items-center gap-2 flex-wrap">
@@ -2717,6 +2794,11 @@ ${items.join('\n\n')}
                     {skipKillZone && (
                       <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
                         KILLZONE GATE OFF
+                      </span>
+                    )}
+                    {SKIP_WEEKENDS && (
+                      <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-amber-500/20 text-amber-300 border border-amber-500/30">
+                        WEEKEND FILTER ON
                       </span>
                     )}
                     <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-amber-500/20 text-amber-300 border border-amber-500/30">
@@ -2832,6 +2914,7 @@ ${items.join('\n\n')}
                     const isProfit = (trade.pnlPercentage ?? 0) >= 0;
                     const isLong = trade.direction.includes('BUY');
                     const startTime = trade.startTime || trade.createdAt || Date.now();
+                    const hasNative = Boolean(trade.binanceSlOrderId && trade.binanceTpOrderId);
                     return (
                       <div key={trade.id} className={`p-3 rounded-xl border transition-all ${isProfit ? 'bg-slate-900/90 border-emerald-500/40' : 'bg-slate-900/90 border-rose-500/40'} flex flex-col justify-between`}>
                         <div className="flex items-center justify-between pb-1.5 border-b border-slate-800">
@@ -2869,9 +2952,15 @@ ${items.join('\n\n')}
                         <div className="text-[10px] font-mono space-y-0.5 text-slate-400 pt-1 border-t border-slate-800/80">
                           <div className="flex justify-between"><span>Entry:</span><span className="text-slate-200">${trade.entryPrice < 2 ? trade.entryPrice.toFixed(4) : trade.entryPrice.toLocaleString()}</span></div>
                           <div className="flex justify-between"><span>Live:</span><span className={`font-bold ${isProfit ? 'text-emerald-300' : 'text-rose-300'}`}>${trade.currentPrice < 2 ? trade.currentPrice.toFixed(4) : trade.currentPrice.toLocaleString()}</span></div>
-                          <div className="flex justify-between text-rose-400 font-semibold"><span className="text-slate-400 flex items-center gap-1"><ShieldAlert className="w-3 h-3 text-rose-400/90" /><span>SL:</span></span><span className="font-bold">{trade.stopLoss ? `$${trade.stopLoss < 2 ? trade.stopLoss.toFixed(4) : trade.stopLoss.toLocaleString()}` : 'N/A'}</span></div>
+                          <div className="flex justify-between text-rose-400 font-semibold">
+                            <span className="text-slate-400 flex items-center gap-1">
+                              <ShieldAlert className="w-3 h-3 text-rose-400/90" />
+                              <span>SL{hasNative ? '' : ' (local)'}:</span>
+                            </span>
+                            <span className="font-bold">{trade.stopLoss ? `$${trade.stopLoss < 2 ? trade.stopLoss.toFixed(4) : trade.stopLoss.toLocaleString()}` : 'N/A'}</span>
+                          </div>
                           <div className="flex justify-between text-emerald-400 font-semibold"><span className="text-slate-400 flex items-center gap-1"><Target className="w-3 h-3 text-emerald-400/90" /><span>TP1:</span></span><span>${trade.takeProfit1 ? (trade.takeProfit1 < 2 ? trade.takeProfit1.toFixed(4) : trade.takeProfit1.toLocaleString()) : 'N/A'}</span></div>
-                          {trade.binanceSlOrderId && trade.binanceTpOrderId && (
+                          {hasNative && (
                             <div className="flex justify-between text-emerald-300">
                               <span className="text-slate-400 flex items-center gap-1"><Lock className="w-3 h-3" /><span>Algo SL/TP:</span></span>
                               <span className="truncate max-w-[100px]" title={`SL:${trade.binanceSlOrderId} TP:${trade.binanceTpOrderId}`}>✅ armed</span>
@@ -3056,7 +3145,7 @@ ${items.join('\n\n')}
                         setApiSettings((p) => ({ ...p, environment: env, geoBlocked: false, lastError: null }));
                         listenKeyAttemptedRef.current = false;
                         listenKeyFatalRef.current = false;
-                        orphanCheckRanRef.current = false; // re-check orphans on env change
+                        orphanCheckRanRef.current = false;
                       }}
                       className={`px-3 py-2 rounded-lg text-xs font-bold font-mono border transition-colors cursor-pointer ${
                         apiSettings.environment === env
@@ -3137,9 +3226,9 @@ ${items.join('\n\n')}
               <h4 className="text-xs font-bold text-white mb-2">🛡️ Safety Layers Active</h4>
               <div className="text-[11px] text-slate-400 space-y-1 font-mono">
                 <div>✅ Leverage set on Binance once per symbol ({botConfig.binance_config.leverage}x)</div>
-                <div>✅ Margin type set to ISOLATED (self-contained collateral per trade)</div>
+                <div>✅ Margin type set to ISOLATED</div>
                 <div>✅ Margin-type pre-check avoids -4046 400 responses</div>
-                <div>✅ Algo SL/TP via /fapi/v1/algoOrder (algoType=CONDITIONAL, triggerPrice, closePosition=true)</div>
+                <div>✅ Algo SL/TP via /fapi/v1/algoOrder</div>
                 <div>✅ Stale algo orders cancelled before every new attach</div>
                 <div>✅ Hard block if balance unknown or stale (&gt;60s)</div>
                 <div>✅ Direction cap: max {MAX_SAME_DIRECTION} longs / {MAX_SAME_DIRECTION} shorts</div>
@@ -3150,29 +3239,33 @@ ${items.join('\n\n')}
                 <div>✅ Quantity floored to LOT_SIZE, triggerPrice to PRICE_FILTER</div>
                 <div>✅ Fill price resolved from /fapi/v1/order when POST omits avgPrice</div>
                 <div>✅ Price-drift guard: skip entries if price moved &gt;{(MAX_ENTRY_DRIFT_PCT * 100).toFixed(1)}% since scoring</div>
-                <div>✅ Position-exists guard: skip entries if symbol already has an open position</div>
+                <div>✅ Position-exists guard</div>
                 <div>✅ Pre-close check avoids -2022 ReduceOnly rejections</div>
                 <div>✅ ATR-scaled SL at 2.2× (outside noise band)</div>
-                <div>✅ Funding-rate crowding filter (rejects |funding| &gt; {(FUNDING_CROWDED_THRESHOLD * 100).toFixed(3)}%)</div>
-                <div>✅ 15m + 1h trend confirmation gates before every entry</div>
+                <div>✅ Funding-rate crowding filter (|funding| &gt; {(FUNDING_CROWDED_THRESHOLD * 100).toFixed(3)}%)</div>
+                <div>✅ 15m + 1h trend confirmation gates</div>
                 <div>✅ 15-minute candle-close window (last 30s only)</div>
-                <div>✅ Killzone ENTER/EXIT alerts to Telegram</div>
-                <div>✅ Side-effects extracted from state updaters (StrictMode-safe — no duplicate journal/Telegram/PnL)</div>
+                <div>✅ Side-effects extracted from state updaters (StrictMode-safe)</div>
                 <div>✅ signalsRef mirrored synchronously via addSignals/removeSignal/patchSignal</div>
-                <div>✅ User-stream keep-alive every 25 min with automatic reconnect on failure</div>
-                <div>✅ Daily-P&amp;L gate triggers on drawdown only (winning days never pause the bot)</div>
-                <div>✅ AI-unavailable warning surfaced to dashboard + console once per session</div>
-                <div>✅ AI short-circuit when no key loaded (saves ~6s per setup)</div>
-                <div>✅ Orphan rescue: 5s mount delay + full diagnostic logging (tracked vs Binance)</div>
-                <div>✅ Orphan rescue: "ALL positions are orphans" warning (redeploy signature)</div>
-                <div>✅ Orphan close: requires explicit window.confirm() with position list</div>
-                <div>✅ FORCE SCAN disabled while orphans exist (prevents silent skip)</div>
+                <div>✅ User-stream keep-alive every 25 min with automatic reconnect</div>
+                <div>✅ Daily-P&amp;L gate triggers on drawdown only</div>
+                <div>✅ AI-unavailable warning surfaced once per session</div>
+                <div>✅ AI short-circuit when no key loaded</div>
+                <div>✅ Orphan rescue: 5s mount delay + full diagnostic logging</div>
+                <div>✅ Orphan close: requires explicit window.confirm()</div>
+                <div>✅ FORCE SCAN disabled while orphans exist</div>
                 <div>✅ $100 MODE: direction cap = {MAX_SAME_DIRECTION}/side, max {MAX_ACTIVE_TRADES} concurrent</div>
                 <div>✅ $100 MODE: margin ≤ {MAX_MARGIN_USE_PCT}% per trade, whitelist = {SCAN_WHITELIST.size} liquid majors</div>
                 <div>✅ $100 MODE: SL cooldown = {Math.round(COOLDOWN_AFTER_SL_MS / 60000)}min, max {MAX_ENTRIES_PER_SYMBOL_PER_DAY} entries/symbol/day</div>
-                <div>✅ Time stop: dead 5m scalps recycled after {Math.round(TIME_STOP_MS / 60000)}m if PnL between {TIME_STOP_MIN_PNL}% and +{TIME_STOP_MAX_PNL}%</div>
-                <div>✅ SHORT-WATCH + SHORT-CANDIDATE diagnostics visible in console</div>
-                <div>{aiValidatorEnabled && isAiValidatorConfigured() ? '✅ AI Trade Validator ON (fires on every setup ≥ 70, receives funding + win-rate context)' : aiValidatorEnabled ? '⚠️ AI Validator toggled ON but no key loaded — running rules-only' : '⏸ AI Trade Validator OFF'}</div>
+                <div>✅ Time stop: dead 5m scalps recycled after {Math.round(TIME_STOP_MS / 60000)}m</div>
+                <div>✅ FIX: Trailing SL disabled for trades with Binance algo SL</div>
+                <div>✅ FIX: SL REPAIR on startup — syncs sig.stopLoss with Binance trigger</div>
+                <div>✅ <strong>FIX: Phantom reconciliation — auto-closes signals not on Binance</strong></div>
+                <div>✅ <strong>FIX: Signals array pruned to keep ACTIVE + last {SIGNALS_KEEP_CLOSED} CLOSED</strong></div>
+                <div>✅ <strong>FIX: Journal date display computed from timestamp (no more frozen "Today")</strong></div>
+                <div>✅ WEEKEND FILTER: {SKIP_WEEKENDS ? 'ON — no new entries Sat/Sun UTC' : 'OFF'}</div>
+                <div>✅ SHORT-WATCH + SHORT-CANDIDATE diagnostics in console</div>
+                <div>{aiValidatorEnabled && isAiValidatorConfigured() ? '✅ AI Trade Validator ON' : aiValidatorEnabled ? '⚠️ AI Validator ON but no key — running rules-only' : '⏸ AI Trade Validator OFF'}</div>
               </div>
             </div>
 
