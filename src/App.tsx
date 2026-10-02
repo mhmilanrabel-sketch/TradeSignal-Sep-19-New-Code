@@ -90,8 +90,11 @@ const NETWORK_OFFLINE_KILL_THRESHOLD_MS = 5 * 60_000;
 
 const SIGNALS_KEEP_CLOSED = 20;
 
-// 🔴 NEW: Reconciliation interval — cross-check Binance positions vs ACTIVE signals
-const RECONCILE_INTERVAL_MS = 2 * 60_000;   // every 2 minutes
+const RECONCILE_INTERVAL_MS = 2 * 60_000;
+
+// 🔧 PERSISTENCE FIX: localStorage keys for daily state
+const LS_DAILY_PNL_KEY = 'tradesignal_daily_pnl';
+const LS_DAILY_ENTRY_COUNT_KEY = 'tradesignal_daily_entry_count';
 
 const SCAN_WHITELIST = new Set<string>([
   'BTC/USDT', 'ETH/USDT', 'SOL/USDT',
@@ -418,8 +421,45 @@ export const App: React.FC = () => {
   };
 
   const journalRecordedRef = useRef<Set<string>>(new Set());
+
+  // 🔧 PERSISTENCE FIX: restore per-symbol daily entry count from localStorage
+  const dailyEntryCountRef = useRef<Record<string, number>>(
+    (() => {
+      try {
+        const today = new Date().toISOString().slice(0, 10);
+        const saved = localStorage.getItem(LS_DAILY_ENTRY_COUNT_KEY);
+        if (!saved) return {};
+        const parsed = JSON.parse(saved);
+        if (!parsed || typeof parsed !== 'object') return {};
+        const filtered: Record<string, number> = {};
+        for (const [k, v] of Object.entries(parsed)) {
+          if (typeof k === 'string' && k.startsWith(today + '|')) {
+            filtered[k] = Number(v) || 0;
+          }
+        }
+        return filtered;
+      } catch { return {}; }
+    })()
+  );
+  const MAX_ENTRIES_PER_SYMBOL_PER_DAY = 2;
+
   const lossCooldownRef = useRef<Record<string, number>>({});
-  const dailyPnlRef = useRef<{ day: string; pnl: number }>({ day: '', pnl: 0 });
+
+  // 🔧 PERSISTENCE FIX: restore daily PnL from localStorage (only if same UTC day)
+  const dailyPnlRef = useRef<{ day: string; pnl: number }>(
+    (() => {
+      try {
+        const today = new Date().toISOString().slice(0, 10);
+        const saved = localStorage.getItem(LS_DAILY_PNL_KEY);
+        if (!saved) return { day: today, pnl: 0 };
+        const parsed = JSON.parse(saved);
+        if (parsed && parsed.day === today && Number.isFinite(Number(parsed.pnl))) {
+          return { day: today, pnl: Number(parsed.pnl) };
+        }
+        return { day: today, pnl: 0 };
+      } catch { return { day: '', pnl: 0 }; }
+    })()
+  );
 
   const exchangeInfoRef = useRef<Record<string, { stepSize: number; minQty: number; tickSize: number }>>({});
   const exchangeInfoLoadedRef = useRef<boolean>(false);
@@ -429,9 +469,6 @@ export const App: React.FC = () => {
     map: {},
     fetchedAt: 0,
   });
-
-  const dailyEntryCountRef = useRef<Record<string, number>>({});
-  const MAX_ENTRIES_PER_SYMBOL_PER_DAY = 2;
 
   const tripKillSwitch = (reason: string) => {
     if (killSwitchRef.current) return;
@@ -808,6 +845,26 @@ export const App: React.FC = () => {
   useEffect(() => { localStorage.setItem('tradesignal_crypto_signals', JSON.stringify(signals)); }, [signals]);
   useEffect(() => { localStorage.setItem('tradesignal_binance_api_config', JSON.stringify(apiSettings)); }, [apiSettings]);
 
+  // 🔧 PERSISTENCE FIX: persist daily entry count on every change
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        LS_DAILY_ENTRY_COUNT_KEY,
+        JSON.stringify(dailyEntryCountRef.current),
+      );
+    } catch { /* ignore quota errors */ }
+  }, [signals]);
+
+  // 🔧 PERSISTENCE FIX: persist daily PnL on every change
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        LS_DAILY_PNL_KEY,
+        JSON.stringify(dailyPnlRef.current),
+      );
+    } catch { /* ignore quota errors */ }
+  }, [signals]);
+
   useEffect(() => {
     exchangeInfoLoadedRef.current = false;
     exchangeInfoRef.current = {};
@@ -821,12 +878,17 @@ export const App: React.FC = () => {
     return () => clearInterval(t);
   }, [apiSettings.isConfigured, apiSettings.environment, apiSettings.enableFutures, apiSettings.apiKey]);
 
+  // 🔧 PERSISTENCE FIX: rollover also clears/persists localStorage
   useEffect(() => {
     const rollover = () => {
       const today = new Date().toISOString().slice(0, 10);
       if (dailyPnlRef.current.day !== today) {
         dailyPnlRef.current = { day: today, pnl: 0 };
         dailyEntryCountRef.current = {};
+        try {
+          localStorage.setItem(LS_DAILY_PNL_KEY, JSON.stringify({ day: today, pnl: 0 }));
+          localStorage.removeItem(LS_DAILY_ENTRY_COUNT_KEY);
+        } catch { /* ignore */ }
         console.log(`[DAY-ROLLOVER] Daily PnL + per-symbol entry counts reset for ${today}`);
       }
     };
@@ -1335,9 +1397,7 @@ export const App: React.FC = () => {
   };
 
   // ═════════════════════════════════════════════════════════════════════════
-  // 🔴 NEW: reconcileActiveSignals — bulletproof phantom-close detection
-  //    Fetches Binance positions, marks any ACTIVE signal as CLOSED if the
-  //    position is no longer on the exchange. Runs on startup AND every 2 min.
+  // RECONCILE ACTIVE SIGNALS — safety net for missed SL/TP fills
   // ═════════════════════════════════════════════════════════════════════════
   const reconcileActiveSignals = async (tag: string): Promise<void> => {
     if (!apiSettings.apiKey || !apiSettings.apiSecret || !apiSettings.enableFutures) return;
@@ -1356,8 +1416,6 @@ export const App: React.FC = () => {
         const binanceSym = sig.symbol.replace('/', '').toUpperCase();
         if (openSymbols.has(binanceSym)) continue;
 
-        // Position is not on Binance → it was closed (SL/TP/manual).
-        // Fetch the last fill price to compute the real exit.
         let exitPrice = sig.currentPrice || sig.entryPrice;
         let pnlPct = sig.pnlPercentage || 0;
 
@@ -1393,7 +1451,6 @@ export const App: React.FC = () => {
           environment: apiSettings.environment,
         });
 
-        // Update daily PnL + SL cooldown
         if (outcome === 'SL') {
           lossCooldownRef.current[sig.symbol] = Date.now();
           dailyPnlRef.current.pnl -= Math.abs(pnlPct);
@@ -1421,13 +1478,10 @@ export const App: React.FC = () => {
     }
   };
 
-  // ═════════════════════════════════════════════════════════════════════════
-  // 🔴 NEW: Periodic reconciliation — runs every 2 min as a safety net
-  // ═════════════════════════════════════════════════════════════════════════
+  // Periodic reconciliation — every 2 min as safety net
   useEffect(() => {
     if (!apiSettings.apiKey || !apiSettings.apiSecret || !apiSettings.enableFutures) return;
 
-    // First run 10s after mount (lets startup jobs finish)
     const initial = setTimeout(() => {
       reconcileActiveSignals('PERIODIC');
     }, 10_000);
@@ -1468,7 +1522,6 @@ export const App: React.FC = () => {
         try {
           const payload = JSON.parse(event.data);
 
-          // 🔴 IMPROVED: accept more field names + more statuses for ALGO_UPDATE
           if (payload.e === 'ALGO_UPDATE') {
             const o = payload.o ?? {};
             const rawSymbol = o.s ?? o.symbol ?? o.Symbol;
@@ -1481,7 +1534,6 @@ export const App: React.FC = () => {
 
             if (!rawSymbol || !algoId) return;
 
-            // Accept multiple "done" statuses
             const isDone =
               algoStatus === 'FILLED' ||
               algoStatus === 'TRIGGERED' ||
@@ -2331,7 +2383,6 @@ ${items.join('\n\n')}
           }
         }
 
-        // 🔴 Use shared helper for phantom reconciliation at startup
         await reconcileActiveSignals('STARTUP');
       } catch (err: any) {
         console.warn('[startup-jobs] failed:', err.message);
@@ -2956,9 +3007,11 @@ ${items.join('\n\n')}
                     <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-teal-500/20 text-teal-300 border border-teal-500/30">
                       VOL FILTER 1.2×
                     </span>
-                    {/* 🔴 NEW BADGE: automatic reconciliation */}
                     <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-violet-500/20 text-violet-300 border border-violet-500/30">
                       AUTO-RECONCILE 2m
+                    </span>
+                    <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-pink-500/20 text-pink-300 border border-pink-500/30">
+                      PERSISTENT STATE
                     </span>
                     {aiValidatorEnabled && (
                       <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-purple-500/20 text-purple-300 border border-purple-500/30 flex items-center gap-1">
@@ -3168,7 +3221,7 @@ ${items.join('\n\n')}
                   {dailyPnlRef.current.pnl >= 0 ? '+' : ''}{dailyPnlRef.current.pnl.toFixed(2)}%
                 </div>
                 <div className="text-[10px] font-mono text-slate-500 mt-0.5">
-                  Kill at -{MAX_DAILY_LOSS_PCT}%
+                  Kill at -{MAX_DAILY_LOSS_PCT}% · persisted
                 </div>
               </div>
               <div className="bg-slate-900/80 border border-slate-800 p-3 rounded-xl">
@@ -3384,7 +3437,8 @@ ${items.join('\n\n')}
                 <div>✅ Per-symbol ATR thresholds — BTC 0.18% / ETH 0.20% / SOL 0.28% / alts 0.30–0.40%</div>
                 <div>✅ TIME STOP extended 30m → {Math.round(TIME_STOP_MS / 60000)}m (gives TP1 room to hit)</div>
                 <div>✅ R:R lowered 2.5 → {botConfig.risk_engine.min_reward_risk_ratio} (realistic TP target)</div>
-                <div>✅ <strong>AUTO-RECONCILE every {Math.round(RECONCILE_INTERVAL_MS / 60000)}m — detects SL/TP fills that WebSocket missed and marks trades CLOSED</strong></div>
+                <div>✅ AUTO-RECONCILE every {Math.round(RECONCILE_INTERVAL_MS / 60000)}m — detects SL/TP fills that WebSocket missed</div>
+                <div>✅ <strong>PERSISTENT STATE — daily PnL + per-symbol entry caps survive page reload</strong></div>
                 <div>✅ Gemini AI Validator model: gemini-3.8-flash (fast-fails on 503 overload)</div>
                 <div>✅ WEEKEND FILTER: {SKIP_WEEKENDS ? 'ON — no new entries Sat/Sun UTC' : 'OFF'}</div>
                 <div>{aiValidatorEnabled && isAiValidatorConfigured() ? '✅ AI Trade Validator ON' : aiValidatorEnabled ? '⚠️ AI Validator ON but no key — running rules-only' : '⏸ AI Trade Validator OFF'}</div>

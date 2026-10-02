@@ -260,7 +260,6 @@ async function callGeminiRest(
 
       const text = await res.text();
 
-      // 🔴 NEW: Fast-fail on 503 — server overloaded, try again next round.
       if (res.status === 503) {
         console.warn(`[aiValidator] Gemini 503 on "${model}" — server overloaded, aborting AI call`);
         return null;
