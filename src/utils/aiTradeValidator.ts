@@ -93,9 +93,6 @@ const IDB_NAME = 'tradesignal';
 const IDB_STORE = 'keys';
 const IDB_KEY = 'gemini';
 
-// ────────────────────────────────────────────────────────────────────────────
-// IndexedDB helper — the most reliable storage inside iframe sandboxes.
-// ────────────────────────────────────────────────────────────────────────────
 function idbGet(): Promise<string | null> {
   return new Promise((resolve) => {
     try {
@@ -140,29 +137,20 @@ function idbSet(value: string): Promise<void> {
   });
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Key resolution — env → global → URL hash → localStorage → sessionStorage
-//                 → cookie → window.name → IndexedDB (async fallback).
-// ────────────────────────────────────────────────────────────────────────────
 let __asyncKeyCache: string = '';
-// ✏️ NEW — one-shot warning guard so the "no key" console.warn only prints
-//           a single time per page session instead of on every AI check.
 let __noKeyWarnedOnce = false;
 
 function getGeminiApiKey(): string {
   try {
-    // 1. Vite build-time env
     const env: any = (import.meta as any)?.env ?? {};
     const fromEnv = env.VITE_GEMINI_API_KEY || env.GEMINI_API_KEY || '';
     if (typeof fromEnv === 'string' && fromEnv.trim().length > 0) return fromEnv.trim();
 
-    // 2. Runtime global (set by setGeminiKey or URL-hash pickup)
     if (typeof window !== 'undefined') {
       const g = (window as any).__GEMINI_API_KEY__;
       if (typeof g === 'string' && g.trim().length > 0) return g.trim();
     }
 
-    // 3. URL hash — survives iframe reloads when hash is present
     if (typeof window !== 'undefined' && window.location.hash) {
       const m = window.location.hash.match(/(?:^|[#&])gk=([^&]+)/);
       if (m && m[1]) {
@@ -171,7 +159,6 @@ function getGeminiApiKey(): string {
       }
     }
 
-    // 4. localStorage
     if (typeof window !== 'undefined') {
       try {
         const ls = window.localStorage.getItem(LS_KEY_NAME);
@@ -179,7 +166,6 @@ function getGeminiApiKey(): string {
       } catch { /* blocked */ }
     }
 
-    // 5. sessionStorage
     if (typeof window !== 'undefined') {
       try {
         const ss = window.sessionStorage.getItem(SS_KEY_NAME);
@@ -187,7 +173,6 @@ function getGeminiApiKey(): string {
       } catch { /* blocked */ }
     }
 
-    // 6. cookie — NOT blocked in most sandboxed iframes
     if (typeof document !== 'undefined' && document.cookie) {
       try {
         const m = document.cookie.match(new RegExp(`(?:^|;\\s*)${COOKIE_KEY_NAME}=([^;]+)`));
@@ -198,7 +183,6 @@ function getGeminiApiKey(): string {
       } catch { /* blocked */ }
     }
 
-    // 7. window.name — persists across iframe reloads, not sandbox-blocked
     if (typeof window !== 'undefined' && typeof window.name === 'string') {
       if (window.name.startsWith(WINDOW_NAME_PREFIX)) {
         const k = window.name.slice(WINDOW_NAME_PREFIX.length).trim();
@@ -206,15 +190,12 @@ function getGeminiApiKey(): string {
       }
     }
 
-    // 8. IndexedDB — async; returns cached value from previous resolution
     return __asyncKeyCache;
   } catch {
     return __asyncKeyCache;
   }
 }
 
-// Background IndexedDB rehydration: called once at module load. When it
-// resolves, we set the global so subsequent sync reads pick it up.
 async function hydrateFromIndexedDb(): Promise<void> {
   try {
     const k = await idbGet();
@@ -234,22 +215,15 @@ export function isAiValidatorConfigured(): boolean {
   return getGeminiApiKey().length > 0;
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// 🔧 FIXED: Gemini model name was outdated → HTTP 404 on every request.
-//    Google's error message (Oct 2026) recommended `gemini-3.8-flash`.
-//    We now try a prioritized fallback list so future deprecations don't kill
-//    the validator outright.
-// ────────────────────────────────────────────────────────────────────────────
 const GEMINI_MODEL_FALLBACKS = [
-  'gemini-3.8-flash',   // ✅ primary (per Google's deprecation notice)
-  'gemini-3.5-flash',   // 🟡 first fallback
-  'gemini-2.5-flash',   // 🟡 legacy — may still work in some regions
-  'gemini-1.5-flash',   // 🟡 oldest fallback
+  'gemini-3.8-flash',
+  'gemini-3.5-flash',
+  'gemini-2.5-flash',
+  'gemini-1.5-flash',
 ] as const;
 
 const GEMINI_ENDPOINT_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
 
-// Module-level cache of which model succeeded last — avoids hammering 404s.
 let __workingModel: string | null = null;
 
 async function callGeminiRest(
@@ -257,7 +231,6 @@ async function callGeminiRest(
   systemPrompt: string,
   userJson: string,
 ): Promise<string | null> {
-  // 🔧 NEW: If we already found a working model this session, use it first.
   const modelsToTry: string[] = __workingModel
     ? [__workingModel, ...GEMINI_MODEL_FALLBACKS.filter((m) => m !== __workingModel)]
     : [...GEMINI_MODEL_FALLBACKS];
@@ -287,7 +260,12 @@ async function callGeminiRest(
 
       const text = await res.text();
 
-      // 🔧 NEW: On 404, log + try the next model silently.
+      // 🔴 NEW: Fast-fail on 503 — server overloaded, try again next round.
+      if (res.status === 503) {
+        console.warn(`[aiValidator] Gemini 503 on "${model}" — server overloaded, aborting AI call`);
+        return null;
+      }
+
       if (res.status === 404) {
         console.warn(
           `[aiValidator] Model "${model}" returned 404 (deprecated) — trying next fallback…`
@@ -297,9 +275,7 @@ async function callGeminiRest(
 
       if (!res.ok) {
         console.warn(`[aiValidator] Gemini HTTP ${res.status} on "${model}" — body: ${text.slice(0, 400)}`);
-        // Auth / quota errors are not model-specific — bail out entirely.
         if (res.status === 401 || res.status === 403 || res.status === 429) return null;
-        // Any other error: try next model
         continue;
       }
 
@@ -313,7 +289,6 @@ async function callGeminiRest(
       const candidate = data?.candidates?.[0];
       const partText = candidate?.content?.parts?.[0]?.text;
       if (typeof partText === 'string' && partText.length > 0) {
-        // 🔧 NEW: Remember which model worked so we skip the 404 dance next time.
         if (__workingModel !== model) {
           __workingModel = model;
           console.log(
@@ -325,15 +300,12 @@ async function callGeminiRest(
       }
 
       console.warn(`[aiValidator] Model "${model}" returned no text part. Raw:`, text.slice(0, 300));
-      // Continue to next model
     } catch (err: any) {
       console.warn(`[aiValidator] Network error on "${model}": ${err.message}`);
-      // Network errors are not model-specific — bail out
       return null;
     }
   }
 
-  // All models failed
   console.warn(
     '[aiValidator] ❌ All Gemini models failed. Check the "testGeminiKey" console helper for a list of available models.'
   );
@@ -346,11 +318,9 @@ export async function validateTradeWithAi(
 ): Promise<AiValidationResult | null> {
   const apiKey = getGeminiApiKey();
   if (!apiKey) {
-    // One last async attempt via IndexedDB before giving up
     await hydrateFromIndexedDb();
     const retry = getGeminiApiKey();
     if (!retry) {
-      // ✏️ FIXED — warn only ONCE per page session (was spamming console).
       if (!__noKeyWarnedOnce) {
         __noKeyWarnedOnce = true;
         console.warn(
@@ -436,9 +406,6 @@ export async function validateTradeWithAi(
   return Promise.race([race, timeout]);
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Console helpers
-// ────────────────────────────────────────────────────────────────────────────
 if (typeof window !== 'undefined') {
   (window as any).setGeminiKey = async (key: string) => {
     if (typeof key !== 'string' || key.trim().length === 0) {
@@ -448,7 +415,6 @@ if (typeof window !== 'undefined') {
     const v = key.trim();
     let storedCount = 0;
 
-    // Persist to every layer we can
     try { window.localStorage.setItem(LS_KEY_NAME, v); storedCount++; }
     catch { /* blocked */ }
 
@@ -472,8 +438,8 @@ if (typeof window !== 'undefined') {
 
     (window as any).__GEMINI_API_KEY__ = v;
     __asyncKeyCache = v;
-    __noKeyWarnedOnce = false; // reset warning guard on fresh key
-    __workingModel = null;      // 🔧 NEW: reset model cache — re-probe on next call
+    __noKeyWarnedOnce = false;
+    __workingModel = null;
 
     if (storedCount > 0) {
       console.log(`%c✅ Key stored in ${storedCount} storage layer(s) — reloading in 1s…`, 'color:#00E676;font-weight:bold');
@@ -500,7 +466,7 @@ if (typeof window !== 'undefined') {
     (window as any).__GEMINI_API_KEY__ = undefined;
     __asyncKeyCache = '';
     __noKeyWarnedOnce = false;
-    __workingModel = null; // 🔧 NEW
+    __workingModel = null;
     console.log('%c🗑️ Key cleared from all storage layers', 'color:#FFB300;font-weight:bold');
   };
 
@@ -530,7 +496,6 @@ if (typeof window !== 'undefined') {
       } else if (Array.isArray(data?.models)) {
         console.log(`%c✅ Key works — ${data.models.length} Gemini models available`, 'color:#00E676; font-weight:bold');
 
-        // 🔧 NEW: List which of our preferred models Google actually supports right now.
         const availableNames = data.models
           .map((m: any) => String(m?.name || '').replace(/^models\//, ''))
           .filter(Boolean);
@@ -565,7 +530,6 @@ if (typeof window !== 'undefined') {
     }
   };
 
-  // Auto-pickup key from URL hash — persists to every layer on load
   try {
     const m = window.location.hash.match(/(?:^|[#&])gk=([^&]+)/);
     if (m && m[1]) {
@@ -584,7 +548,6 @@ if (typeof window !== 'undefined') {
     }
   } catch { /* ignore */ }
 
-  // Kick off IndexedDB rehydration in the background
   try { hydrateFromIndexedDb(); } catch { /* ignore */ }
 
   console.log('%c🧠 Gemini test ready — type `await window.testGeminiKey()`', 'color:#9D4EDD; font-style:italic');

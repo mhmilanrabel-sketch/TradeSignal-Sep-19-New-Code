@@ -82,15 +82,16 @@ const FUNDING_CACHE_TTL_MS = 10 * 60_000;
 const USER_STREAM_KEEPALIVE_MS = 25 * 60_000;
 const MAX_ENTRY_DRIFT_PCT = 0.010;
 
-// 🔧 CHANGED: 30 min → 60 min so TP1 has a realistic chance to be hit
 const TIME_STOP_MS = 60 * 60_000;
-
 const TIME_STOP_MIN_PNL = -0.5;
 const TIME_STOP_MAX_PNL = 0.3;
 
 const NETWORK_OFFLINE_KILL_THRESHOLD_MS = 5 * 60_000;
 
 const SIGNALS_KEEP_CLOSED = 20;
+
+// 🔴 NEW: Reconciliation interval — cross-check Binance positions vs ACTIVE signals
+const RECONCILE_INTERVAL_MS = 2 * 60_000;   // every 2 minutes
 
 const SCAN_WHITELIST = new Set<string>([
   'BTC/USDT', 'ETH/USDT', 'SOL/USDT',
@@ -1333,6 +1334,118 @@ export const App: React.FC = () => {
     };
   };
 
+  // ═════════════════════════════════════════════════════════════════════════
+  // 🔴 NEW: reconcileActiveSignals — bulletproof phantom-close detection
+  //    Fetches Binance positions, marks any ACTIVE signal as CLOSED if the
+  //    position is no longer on the exchange. Runs on startup AND every 2 min.
+  // ═════════════════════════════════════════════════════════════════════════
+  const reconcileActiveSignals = async (tag: string): Promise<void> => {
+    if (!apiSettings.apiKey || !apiSettings.apiSecret || !apiSettings.enableFutures) return;
+
+    try {
+      const activeSignals = signalsRef.current.filter((s) => s.status === 'ACTIVE');
+      if (activeSignals.length === 0) return;
+
+      const openPositions = await getAllOpenPositions();
+      const openSymbols = new Set(openPositions.map((p) => p.symbol));
+
+      console.log(`[RECONCILE-${tag}] checking ${activeSignals.length} active signal(s) against Binance`);
+      let fixedCount = 0;
+
+      for (const sig of activeSignals) {
+        const binanceSym = sig.symbol.replace('/', '').toUpperCase();
+        if (openSymbols.has(binanceSym)) continue;
+
+        // Position is not on Binance → it was closed (SL/TP/manual).
+        // Fetch the last fill price to compute the real exit.
+        let exitPrice = sig.currentPrice || sig.entryPrice;
+        let pnlPct = sig.pnlPercentage || 0;
+
+        try {
+          const lastFill = await fetchLastFillPrice(binanceSym);
+          if (lastFill) {
+            exitPrice = lastFill.price;
+            const isLong = sig.direction.includes('BUY');
+            const rawPnl = isLong
+              ? ((exitPrice - sig.entryPrice) / sig.entryPrice) * 100
+              : ((sig.entryPrice - exitPrice) / sig.entryPrice) * 100;
+            pnlPct = Number(rawPnl.toFixed(2));
+          }
+        } catch { /* fallback to stored values */ }
+
+        const outcome: ClosedOutcome =
+          pnlPct > 0.5 ? 'TP1'
+          : pnlPct < -0.5 ? 'SL'
+          : 'MANUAL';
+
+        console.log(
+          `[RECONCILE-${tag}] ${sig.symbol}: NOT on Binance → marking CLOSED ` +
+          `(exit $${exitPrice}, pnl ${pnlPct}%, outcome ${outcome})`
+        );
+
+        markClosedHandled(sig.id);
+        recordClosedSignalToJournal(sig, exitPrice, outcome, pnlPct);
+        alertTradeClosed({
+          symbol: sig.symbol, direction: sig.direction,
+          entryPrice: sig.entryPrice, exitPrice,
+          pnlPercentage: pnlPct, outcome,
+          duration: formatDuration(sig.startTime || Date.now()),
+          environment: apiSettings.environment,
+        });
+
+        // Update daily PnL + SL cooldown
+        if (outcome === 'SL') {
+          lossCooldownRef.current[sig.symbol] = Date.now();
+          dailyPnlRef.current.pnl -= Math.abs(pnlPct);
+        } else if (outcome === 'TP1') {
+          dailyPnlRef.current.pnl += Math.abs(pnlPct);
+        }
+
+        patchSignal(sig.id, {
+          status: 'CLOSED',
+          outcome,
+          closedAt: Date.now(),
+          currentPrice: exitPrice,
+          pnlPercentage: pnlPct,
+        });
+
+        fixedCount++;
+      }
+
+      if (fixedCount > 0) {
+        console.log(`[RECONCILE-${tag}] ✅ Reconciled ${fixedCount} phantom trade(s)`);
+      }
+      await refreshAccountSnapshot();
+    } catch (err: any) {
+      console.warn(`[RECONCILE-${tag}] failed:`, err.message);
+    }
+  };
+
+  // ═════════════════════════════════════════════════════════════════════════
+  // 🔴 NEW: Periodic reconciliation — runs every 2 min as a safety net
+  // ═════════════════════════════════════════════════════════════════════════
+  useEffect(() => {
+    if (!apiSettings.apiKey || !apiSettings.apiSecret || !apiSettings.enableFutures) return;
+
+    // First run 10s after mount (lets startup jobs finish)
+    const initial = setTimeout(() => {
+      reconcileActiveSignals('PERIODIC');
+    }, 10_000);
+
+    const t = setInterval(() => {
+      reconcileActiveSignals('PERIODIC');
+    }, RECONCILE_INTERVAL_MS);
+
+    return () => {
+      clearTimeout(initial);
+      clearInterval(t);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [apiSettings.apiKey, apiSettings.apiSecret, apiSettings.enableFutures]);
+
+  // ═════════════════════════════════════════════════════════════════════════
+  // USER DATA STREAM
+  // ═════════════════════════════════════════════════════════════════════════
   useEffect(() => {
     if (!apiSettings.apiKey || !apiSettings.enableFutures) return;
     if (listenKeyFatalRef.current) return;
@@ -1355,18 +1468,30 @@ export const App: React.FC = () => {
         try {
           const payload = JSON.parse(event.data);
 
+          // 🔴 IMPROVED: accept more field names + more statuses for ALGO_UPDATE
           if (payload.e === 'ALGO_UPDATE') {
             const o = payload.o ?? {};
-            const rawSymbol = o.s ?? o.symbol;
-            const algoId = o.aid != null ? String(o.aid)
-                          : (o.algoId != null ? String(o.algoId) : null);
-            const algoStatus = o.st ?? o.algoStatus ?? '';
-            const triggerPrice = parseFloat(o.tp ?? o.triggerPrice ?? '0') || 0;
+            const rawSymbol = o.s ?? o.symbol ?? o.Symbol;
+            const algoIdRaw = o.aid ?? o.algoId ?? o.clientAlgoId ?? o.caid;
+            const algoId = algoIdRaw != null ? String(algoIdRaw) : null;
+            const algoStatus = String(o.st ?? o.algoStatus ?? o.X ?? '').toUpperCase();
+            const triggerPrice = parseFloat(
+              String(o.tp ?? o.triggerPrice ?? o.actualPrice ?? o.ap ?? '0')
+            ) || 0;
 
             if (!rawSymbol || !algoId) return;
-            if (algoStatus !== 'FILLED' && algoStatus !== 'TRIGGERED') return;
 
-            const symbolFormatted = `${rawSymbol.replace(/USDT$/, '')}/USDT`;
+            // Accept multiple "done" statuses
+            const isDone =
+              algoStatus === 'FILLED' ||
+              algoStatus === 'TRIGGERED' ||
+              algoStatus === 'FINISHED' ||
+              algoStatus === 'EXPIRED' ||
+              algoStatus === 'CANCELLED';
+
+            if (!isDone) return;
+
+            const symbolFormatted = `${String(rawSymbol).replace(/USDT$/, '')}/USDT`;
 
             const target = signalsRef.current.find((sig) => {
               if (sig.symbol !== symbolFormatted) return false;
@@ -1641,7 +1766,7 @@ ${items.join('\n\n')}
     setTimeout(() => setCopiedAllTrades(false), 2000);
   };
 
-  // MAIN SCAN — per-symbol ATR, 4h bias filter, volume confirmation
+  // MAIN SCAN
   const handleExecuteCryptoScalpScan = async () => {
     console.log('[SCAN] ========== Scan starting ==========');
     if (killSwitchRef.current) {
@@ -1817,7 +1942,6 @@ ${items.join('\n\n')}
         }
       }
 
-      // 4H BIAS FILTER
       const { candles: candles4h } = await getRealCandles(asset.symbol, '4h', 60);
       if (candles4h.length >= 30) {
         const trend4h = scoreConfluence(candles4h, asset.symbol);
@@ -1834,7 +1958,6 @@ ${items.join('\n\n')}
         }
       }
 
-      // VOLUME CONFIRMATION
       const vol = hasVolumeConfirmation(candles, 3, 20, 1.2);
       console.log(
         `[SCAN] ${asset.symbol}: volume check — short(3)=${vol.shortAvg.toFixed(2)} long(20)=${vol.longAvg.toFixed(2)} ` +
@@ -2119,6 +2242,9 @@ ${items.join('\n\n')}
   const scanFnRef = useRef(handleExecuteCryptoScalpScan);
   useEffect(() => { scanFnRef.current = handleExecuteCryptoScalpScan; });
 
+  // ═════════════════════════════════════════════════════════════════════════
+  // STARTUP JOBS
+  // ═════════════════════════════════════════════════════════════════════════
   const orphanCheckRanRef = useRef(false);
   useEffect(() => {
     if (!apiSettings.apiKey || !apiSettings.apiSecret || !apiSettings.enableFutures) return;
@@ -2205,72 +2331,8 @@ ${items.join('\n\n')}
           }
         }
 
-        const openPositions = await getAllOpenPositions();
-        const openSymbols = new Set(openPositions.map((p) => p.symbol));
-
-        const activeSignals = signalsRef.current.filter((s) => s.status === 'ACTIVE');
-        if (activeSignals.length === 0) {
-          return;
-        }
-
-        console.log(`[RECONCILE] checking ${activeSignals.length} active signal(s) against Binance`);
-        let fixedCount = 0;
-
-        for (const sig of activeSignals) {
-          const binanceSym = sig.symbol.replace('/', '').toUpperCase();
-          if (openSymbols.has(binanceSym)) continue;
-
-          let exitPrice = sig.currentPrice || sig.entryPrice;
-          let pnlPct = sig.pnlPercentage || 0;
-
-          try {
-            const lastFill = await fetchLastFillPrice(binanceSym);
-            if (lastFill) {
-              exitPrice = lastFill.price;
-              const isLong = sig.direction.includes('BUY');
-              const rawPnl = isLong
-                ? ((exitPrice - sig.entryPrice) / sig.entryPrice) * 100
-                : ((sig.entryPrice - exitPrice) / sig.entryPrice) * 100;
-              pnlPct = Number(rawPnl.toFixed(2));
-            }
-          } catch { /* use fallback */ }
-
-          const outcome: ClosedOutcome =
-            pnlPct > 0.5 ? 'TP1'
-            : pnlPct < -0.5 ? 'SL'
-            : 'MANUAL';
-
-          console.log(
-            `[RECONCILE] ${sig.symbol}: NOT on Binance → marking CLOSED ` +
-            `(exit $${exitPrice}, pnl ${pnlPct}%, outcome ${outcome})`
-          );
-
-          markClosedHandled(sig.id);
-          recordClosedSignalToJournal(sig, exitPrice, outcome, pnlPct);
-          alertTradeClosed({
-            symbol: sig.symbol, direction: sig.direction,
-            entryPrice: sig.entryPrice, exitPrice,
-            pnlPercentage: pnlPct, outcome,
-            duration: formatDuration(sig.startTime || Date.now()),
-            environment: apiSettings.environment,
-          });
-
-          patchSignal(sig.id, {
-            status: 'CLOSED',
-            outcome,
-            closedAt: Date.now(),
-            currentPrice: exitPrice,
-            pnlPercentage: pnlPct,
-          });
-
-          fixedCount++;
-        }
-
-        if (fixedCount > 0) {
-          console.log(`[RECONCILE] ✅ Reconciled ${fixedCount} phantom trade(s)`);
-        } else {
-          console.log('[RECONCILE] all active signals verified on Binance ✅');
-        }
+        // 🔴 Use shared helper for phantom reconciliation at startup
+        await reconcileActiveSignals('STARTUP');
       } catch (err: any) {
         console.warn('[startup-jobs] failed:', err.message);
       }
@@ -2894,6 +2956,10 @@ ${items.join('\n\n')}
                     <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-teal-500/20 text-teal-300 border border-teal-500/30">
                       VOL FILTER 1.2×
                     </span>
+                    {/* 🔴 NEW BADGE: automatic reconciliation */}
+                    <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-violet-500/20 text-violet-300 border border-violet-500/30">
+                      AUTO-RECONCILE 2m
+                    </span>
                     {aiValidatorEnabled && (
                       <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-purple-500/20 text-purple-300 border border-purple-500/30 flex items-center gap-1">
                         <Brain className="w-3 h-3" />
@@ -3312,14 +3378,14 @@ ${items.join('\n\n')}
                 <div>✅ 5m + 15m + 1h trend confirmation gates</div>
                 <div>✅ 15-minute candle-close window (last 30s only)</div>
                 <div>✅ Network-aware kill switch — short blips (&lt;{Math.round(NETWORK_OFFLINE_KILL_THRESHOLD_MS / 60000)}min) are silently retried</div>
-                <div>✅ Phantom reconciliation — auto-closes signals not on Binance</div>
                 <div>✅ 4h bias filter — rejects counter-trend 5m setups</div>
                 <div>✅ Volume confirmation — last 3 candles ≥ 1.2× 20-candle avg</div>
                 <div>✅ Expanded whitelist — {SCAN_WHITELIST.size} liquid symbols</div>
                 <div>✅ Per-symbol ATR thresholds — BTC 0.18% / ETH 0.20% / SOL 0.28% / alts 0.30–0.40%</div>
-                <div>✅ <strong>TIME STOP extended 30m → {Math.round(TIME_STOP_MS / 60000)}m (gives TP1 room to hit)</strong></div>
-                <div>✅ <strong>R:R lowered 2.5 → {botConfig.risk_engine.min_reward_risk_ratio} (realistic TP target)</strong></div>
-                <div>✅ Gemini AI Validator model: gemini-3.8-flash (with fallbacks)</div>
+                <div>✅ TIME STOP extended 30m → {Math.round(TIME_STOP_MS / 60000)}m (gives TP1 room to hit)</div>
+                <div>✅ R:R lowered 2.5 → {botConfig.risk_engine.min_reward_risk_ratio} (realistic TP target)</div>
+                <div>✅ <strong>AUTO-RECONCILE every {Math.round(RECONCILE_INTERVAL_MS / 60000)}m — detects SL/TP fills that WebSocket missed and marks trades CLOSED</strong></div>
+                <div>✅ Gemini AI Validator model: gemini-3.8-flash (fast-fails on 503 overload)</div>
                 <div>✅ WEEKEND FILTER: {SKIP_WEEKENDS ? 'ON — no new entries Sat/Sun UTC' : 'OFF'}</div>
                 <div>{aiValidatorEnabled && isAiValidatorConfigured() ? '✅ AI Trade Validator ON' : aiValidatorEnabled ? '⚠️ AI Validator ON but no key — running rules-only' : '⏸ AI Trade Validator OFF'}</div>
               </div>
