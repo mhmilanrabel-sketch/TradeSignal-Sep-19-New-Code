@@ -88,6 +88,10 @@ const TIME_STOP_MS = 30 * 60_000;
 const TIME_STOP_MIN_PNL = -0.5;
 const TIME_STOP_MAX_PNL = 0.3;
 
+// 🔧 NEW: Sustained-offline threshold before the kill switch trips.
+//    Short network blips (<5 min) are silently retried — no manual clear needed.
+const NETWORK_OFFLINE_KILL_THRESHOLD_MS = 5 * 60_000;
+
 // Signals array pruning: keep ACTIVE + last N CLOSED to prevent bloat.
 const SIGNALS_KEEP_CLOSED = 20;
 
@@ -315,6 +319,9 @@ export const App: React.FC = () => {
     localStorage.getItem('tradesignal_kill_switch') === '1'
   );
 
+  // 🔧 NEW: Track transient network outages so we can show a banner without tripping kill switch.
+  const [networkOffline, setNetworkOffline] = useState<boolean>(false);
+
   const [accountSnapshot, setAccountSnapshot] = useState<AccountSnapshot | null>(null);
 
   const [orphanPositions, setOrphanPositions] = useState<OrphanPosition[]>([]);
@@ -366,6 +373,11 @@ export const App: React.FC = () => {
   const consecutiveFailuresRef = useRef<number>(0);
   const apiSettingsRef = useRef(apiSettings);
 
+  // 🔧 NEW: Track consecutive network failures + last successful balance fetch.
+  //    Kill switch only trips after NETWORK_OFFLINE_KILL_THRESHOLD_MS of continuous outage.
+  const networkFailureStreakRef = useRef<number>(0);
+  const lastSuccessfulBalanceRef = useRef<number>(Date.now());
+
   const binanceClosedRef = useRef<Set<string>>(
     new Set(JSON.parse(localStorage.getItem('tradesignal_closed_handled_ids') || '[]')),
   );
@@ -411,6 +423,9 @@ export const App: React.FC = () => {
     setKillSwitchOn(false);
     localStorage.removeItem('tradesignal_kill_switch');
     consecutiveFailuresRef.current = 0;
+    networkFailureStreakRef.current = 0; // 🔧 NEW: reset network tracker too
+    lastSuccessfulBalanceRef.current = Date.now(); // 🔧 NEW
+    setNetworkOffline(false); // 🔧 NEW
     setConnectionLog('✅ Kill switch cleared. Trading may resume.');
   };
 
@@ -481,6 +496,13 @@ export const App: React.FC = () => {
     return Number(rounded.toFixed(decimals));
   };
 
+  // ═════════════════════════════════════════════════════════════════════════
+  // 🔧 MODIFIED: refreshAccountSnapshot — network-aware failure handling.
+  //    - Silent retries on short network blips (<5 min) — no kill switch, no manual clear
+  //    - Kill switch only trips after sustained 5-minute outage
+  //    - Auth/API errors still return null but do NOT increment the offline streak
+  //    - networkOffline state drives a UI banner
+  // ═════════════════════════════════════════════════════════════════════════
   const refreshAccountSnapshot = async (): Promise<AccountSnapshot | null> => {
     if (!apiSettings.apiKey || !apiSettings.apiSecret || !apiSettings.enableFutures) return null;
     const baseUrl = getBaseUrl(apiSettings.environment, true);
@@ -507,9 +529,42 @@ export const App: React.FC = () => {
       setAccountSnapshot(snapshot);
       accountSnapshotRef.current = snapshot;
       setApiSettings((prev) => ({ ...prev, usdtBalance: snapshot.availableBalance }));
+
+      // 🔧 NEW: Reset offline tracking on any success.
+      networkFailureStreakRef.current = 0;
+      lastSuccessfulBalanceRef.current = Date.now();
+      setNetworkOffline(false);
+
       return snapshot;
     } catch (err: any) {
       console.warn('[balance] network err', err.message);
+
+      // 🔧 NEW: Classify the failure. Only network errors count toward offline streak.
+      const msg = String(err?.message ?? '');
+      const isNetworkErr =
+        msg.includes('Failed to fetch') ||
+        msg.includes('NetworkError') ||
+        msg.includes('ERR_INTERNET') ||
+        msg.includes('ERR_NETWORK') ||
+        msg.includes('ERR_CONNECTION');
+
+      if (isNetworkErr) {
+        networkFailureStreakRef.current += 1;
+        const offlineMs = Date.now() - lastSuccessfulBalanceRef.current;
+        const offlineSec = Math.round(offlineMs / 1000);
+
+        setNetworkOffline(true);
+        console.log(
+          `[balance] network down (streak ${networkFailureStreakRef.current}, offline ${offlineSec}s)`
+        );
+
+        // 🔧 NEW: Only trip the kill switch after sustained outage.
+        if (offlineMs >= NETWORK_OFFLINE_KILL_THRESHOLD_MS && !killSwitchRef.current) {
+          tripKillSwitch(
+            `Network offline for ${Math.round(offlineMs / 60000)} min — cannot verify balance`
+          );
+        }
+      }
       return null;
     }
   };
@@ -562,7 +617,6 @@ export const App: React.FC = () => {
     } catch { return []; }
   };
 
-  // Fetch the actual trigger price of the SL algo order on Binance for a symbol.
   const fetchActualSlTrigger = async (binanceSym: string): Promise<number | null> => {
     if (!apiSettings.apiKey || !apiSettings.apiSecret) return null;
     const baseUrl = getBaseUrl(apiSettings.environment, true);
@@ -591,7 +645,6 @@ export const App: React.FC = () => {
     } catch { return null; }
   };
 
-  // Fetch last fill price for a symbol (used by reconciliation).
   const fetchLastFillPrice = async (
     binanceSym: string,
   ): Promise<{ price: number; time: number } | null> => {
@@ -1632,12 +1685,12 @@ ${items.join('\n\n')}
       setConnectionLog(`🔄 Balance stale (${ageMs === Infinity ? 'never' : Math.round(ageMs / 1000) + 's'}) — refreshing before scan...`);
       snapshot = await refreshAccountSnapshot();
     }
+
+    // 🔧 MODIFIED: Balance unknown → quiet skip. The kill switch is now owned by
+    //    refreshAccountSnapshot (5-min sustained-outage threshold), NOT by this
+    //    scan loop. Short network blips must NOT halt the bot.
     if (!snapshot) {
-      consecutiveFailuresRef.current += 1;
-      if (consecutiveFailuresRef.current >= MAX_CONSECUTIVE_FAILURES) {
-        tripKillSwitch(`${MAX_CONSECUTIVE_FAILURES} consecutive balance fetch failures`);
-      }
-      setConnectionLog('⛔ Cannot trade — balance unknown. Scan aborted (safety).');
+      setConnectionLog('⛔ Balance unknown — scan skipped (network).');
       return;
     }
     consecutiveFailuresRef.current = 0;
@@ -2141,8 +2194,6 @@ ${items.join('\n\n')}
         }
 
         // ── JOB 4: Phantom reconciliation ──
-        // Any ACTIVE signal whose symbol is not on Binance's position list
-        // is a phantom — close it locally and journal the real exit.
         const openPositions = await getAllOpenPositions();
         const openSymbols = new Set(openPositions.map((p) => p.symbol));
 
@@ -2158,7 +2209,6 @@ ${items.join('\n\n')}
           const binanceSym = sig.symbol.replace('/', '').toUpperCase();
           if (openSymbols.has(binanceSym)) continue;
 
-          // Phantom — position not on Binance. Try to fetch actual exit price.
           let exitPrice = sig.currentPrice || sig.entryPrice;
           let pnlPct = sig.pnlPercentage || 0;
 
@@ -2684,6 +2734,22 @@ ${items.join('\n\n')}
         </div>
       )}
 
+      {/* 🔧 NEW: Network offline banner (transient — auto-clears on recovery). */}
+      {networkOffline && !killSwitchOn && (
+        <div className="bg-amber-600/20 border-b-2 border-amber-500 px-4 py-2 text-[12px] font-mono text-amber-100 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <AlertTriangle className="w-4 h-4 text-amber-300 shrink-0 animate-pulse" />
+            <span>
+              <strong>🌐 NETWORK OFFLINE</strong> — balance refresh failing. New entries paused.
+              Kill switch trips only after {Math.round(NETWORK_OFFLINE_KILL_THRESHOLD_MS / 60000)} min of sustained outage.
+            </span>
+          </div>
+          <span className="text-[10px] text-amber-300/70 shrink-0 hidden sm:inline">
+            streak: {networkFailureStreakRef.current}
+          </span>
+        </div>
+      )}
+
       {killSwitchOn && (
         <div className="bg-rose-600/20 border-b-2 border-rose-500 px-4 py-2 text-[12px] font-mono text-rose-200 flex items-center justify-between gap-3">
           <div className="flex items-center gap-2">
@@ -2753,7 +2819,7 @@ ${items.join('\n\n')}
         </div>
       )}
 
-      {securityHealth.securityAlert && !apiSettings.geoBlocked && apiSettings.isConfigured && !killSwitchOn && (
+      {securityHealth.securityAlert && !apiSettings.geoBlocked && apiSettings.isConfigured && !killSwitchOn && !networkOffline && (
         <div className="bg-amber-500/10 border-b border-amber-500/30 px-4 py-1.5 text-[11px] font-mono text-amber-300 flex items-center justify-between">
           <div className="flex items-center gap-2">
             <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0" />
@@ -3234,7 +3300,7 @@ ${items.join('\n\n')}
                 <div>✅ Direction cap: max {MAX_SAME_DIRECTION} longs / {MAX_SAME_DIRECTION} shorts</div>
                 <div>✅ Free-margin guard: ≤{MAX_MARGIN_USE_PCT}% of available per order</div>
                 <div>✅ Emergency close if SL/TP attach fails (no naked positions)</div>
-                <div>✅ Kill switch tripped by -{MAX_DAILY_LOSS_PCT}% daily loss, {MAX_CONSECUTIVE_FAILURES} failures, or manual</div>
+                <div>✅ Kill switch tripped by -{MAX_DAILY_LOSS_PCT}% daily loss, {MAX_CONSECUTIVE_FAILURES} order failures, or manual</div>
                 <div>✅ Balance re-read between every order in a batch</div>
                 <div>✅ Quantity floored to LOT_SIZE, triggerPrice to PRICE_FILTER</div>
                 <div>✅ Fill price resolved from /fapi/v1/order when POST omits avgPrice</div>
@@ -3260,9 +3326,13 @@ ${items.join('\n\n')}
                 <div>✅ Time stop: dead 5m scalps recycled after {Math.round(TIME_STOP_MS / 60000)}m</div>
                 <div>✅ FIX: Trailing SL disabled for trades with Binance algo SL</div>
                 <div>✅ FIX: SL REPAIR on startup — syncs sig.stopLoss with Binance trigger</div>
-                <div>✅ <strong>FIX: Phantom reconciliation — auto-closes signals not on Binance</strong></div>
-                <div>✅ <strong>FIX: Signals array pruned to keep ACTIVE + last {SIGNALS_KEEP_CLOSED} CLOSED</strong></div>
-                <div>✅ <strong>FIX: Journal date display computed from timestamp (no more frozen "Today")</strong></div>
+                <div>✅ FIX: Phantom reconciliation — auto-closes signals not on Binance</div>
+                <div>✅ FIX: Signals array pruned to keep ACTIVE + last {SIGNALS_KEEP_CLOSED} CLOSED</div>
+                <div>✅ FIX: Journal date display computed from timestamp (no more frozen "Today")</div>
+                {/* 🔧 NEW: This batch */}
+                <div>✅ <strong>NEW: Network-aware kill switch — short blips (&lt;{Math.round(NETWORK_OFFLINE_KILL_THRESHOLD_MS / 60000)}min) are silently retried, no manual clear needed</strong></div>
+                <div>✅ <strong>NEW: Offline banner shows streak + auto-clears on first successful balance fetch</strong></div>
+                <div>✅ <strong>NEW: Balance-fail kill switch removed from scan loop — only 5-min sustained outage trips it</strong></div>
                 <div>✅ WEEKEND FILTER: {SKIP_WEEKENDS ? 'ON — no new entries Sat/Sun UTC' : 'OFF'}</div>
                 <div>✅ SHORT-WATCH + SHORT-CANDIDATE diagnostics in console</div>
                 <div>{aiValidatorEnabled && isAiValidatorConfigured() ? '✅ AI Trade Validator ON' : aiValidatorEnabled ? '⚠️ AI Validator ON but no key — running rules-only' : '⏸ AI Trade Validator OFF'}</div>

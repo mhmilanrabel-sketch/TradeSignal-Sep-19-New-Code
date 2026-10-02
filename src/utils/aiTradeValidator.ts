@@ -234,57 +234,110 @@ export function isAiValidatorConfigured(): boolean {
   return getGeminiApiKey().length > 0;
 }
 
-const GEMINI_MODEL = 'gemini-2.5-flash';
+// ────────────────────────────────────────────────────────────────────────────
+// 🔧 FIXED: Gemini model name was outdated → HTTP 404 on every request.
+//    Google's error message (Oct 2026) recommended `gemini-3.8-flash`.
+//    We now try a prioritized fallback list so future deprecations don't kill
+//    the validator outright.
+// ────────────────────────────────────────────────────────────────────────────
+const GEMINI_MODEL_FALLBACKS = [
+  'gemini-3.8-flash',   // ✅ primary (per Google's deprecation notice)
+  'gemini-3.5-flash',   // 🟡 first fallback
+  'gemini-2.5-flash',   // 🟡 legacy — may still work in some regions
+  'gemini-1.5-flash',   // 🟡 oldest fallback
+] as const;
+
 const GEMINI_ENDPOINT_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
+
+// Module-level cache of which model succeeded last — avoids hammering 404s.
+let __workingModel: string | null = null;
 
 async function callGeminiRest(
   apiKey: string,
   systemPrompt: string,
   userJson: string,
 ): Promise<string | null> {
-  const url = `${GEMINI_ENDPOINT_BASE}/${GEMINI_MODEL}:generateContent`;
+  // 🔧 NEW: If we already found a working model this session, use it first.
+  const modelsToTry: string[] = __workingModel
+    ? [__workingModel, ...GEMINI_MODEL_FALLBACKS.filter((m) => m !== __workingModel)]
+    : [...GEMINI_MODEL_FALLBACKS];
 
-  const body = {
-    systemInstruction: { parts: [{ text: systemPrompt }] },
-    contents: [{ role: 'user', parts: [{ text: userJson }] }],
-    generationConfig: {
-      temperature: 0.1,
-      responseMimeType: 'application/json',
-      maxOutputTokens: 400,
-    },
-  };
+  for (const model of modelsToTry) {
+    const url = `${GEMINI_ENDPOINT_BASE}/${model}:generateContent`;
 
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-goog-api-key': apiKey,
+    const body = {
+      systemInstruction: { parts: [{ text: systemPrompt }] },
+      contents: [{ role: 'user', parts: [{ text: userJson }] }],
+      generationConfig: {
+        temperature: 0.1,
+        responseMimeType: 'application/json',
+        maxOutputTokens: 400,
       },
-      body: JSON.stringify(body),
-    });
+    };
 
-    const text = await res.text();
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': apiKey,
+        },
+        body: JSON.stringify(body),
+      });
 
-    if (!res.ok) {
-      console.warn(`[aiValidator] Gemini HTTP ${res.status} — body: ${text.slice(0, 400)}`);
+      const text = await res.text();
+
+      // 🔧 NEW: On 404, log + try the next model silently.
+      if (res.status === 404) {
+        console.warn(
+          `[aiValidator] Model "${model}" returned 404 (deprecated) — trying next fallback…`
+        );
+        continue;
+      }
+
+      if (!res.ok) {
+        console.warn(`[aiValidator] Gemini HTTP ${res.status} on "${model}" — body: ${text.slice(0, 400)}`);
+        // Auth / quota errors are not model-specific — bail out entirely.
+        if (res.status === 401 || res.status === 403 || res.status === 429) return null;
+        // Any other error: try next model
+        continue;
+      }
+
+      let data: any;
+      try { data = JSON.parse(text); }
+      catch {
+        console.warn('[aiValidator] Non-JSON response from Gemini');
+        continue;
+      }
+
+      const candidate = data?.candidates?.[0];
+      const partText = candidate?.content?.parts?.[0]?.text;
+      if (typeof partText === 'string' && partText.length > 0) {
+        // 🔧 NEW: Remember which model worked so we skip the 404 dance next time.
+        if (__workingModel !== model) {
+          __workingModel = model;
+          console.log(
+            `%c[aiValidator] ✅ Using model: ${model}`,
+            'color:#00E676;font-weight:bold'
+          );
+        }
+        return partText;
+      }
+
+      console.warn(`[aiValidator] Model "${model}" returned no text part. Raw:`, text.slice(0, 300));
+      // Continue to next model
+    } catch (err: any) {
+      console.warn(`[aiValidator] Network error on "${model}": ${err.message}`);
+      // Network errors are not model-specific — bail out
       return null;
     }
-
-    let data: any;
-    try { data = JSON.parse(text); }
-    catch { console.warn('[aiValidator] Non-JSON response from Gemini'); return null; }
-
-    const candidate = data?.candidates?.[0];
-    const partText = candidate?.content?.parts?.[0]?.text;
-    if (typeof partText === 'string' && partText.length > 0) return partText;
-
-    console.warn('[aiValidator] Gemini returned no text part. Raw:', text.slice(0, 300));
-    return null;
-  } catch (err: any) {
-    console.warn(`[aiValidator] Network error: ${err.message}`);
-    return null;
   }
+
+  // All models failed
+  console.warn(
+    '[aiValidator] ❌ All Gemini models failed. Check the "testGeminiKey" console helper for a list of available models.'
+  );
+  return null;
 }
 
 export async function validateTradeWithAi(
@@ -420,6 +473,7 @@ if (typeof window !== 'undefined') {
     (window as any).__GEMINI_API_KEY__ = v;
     __asyncKeyCache = v;
     __noKeyWarnedOnce = false; // reset warning guard on fresh key
+    __workingModel = null;      // 🔧 NEW: reset model cache — re-probe on next call
 
     if (storedCount > 0) {
       console.log(`%c✅ Key stored in ${storedCount} storage layer(s) — reloading in 1s…`, 'color:#00E676;font-weight:bold');
@@ -446,6 +500,7 @@ if (typeof window !== 'undefined') {
     (window as any).__GEMINI_API_KEY__ = undefined;
     __asyncKeyCache = '';
     __noKeyWarnedOnce = false;
+    __workingModel = null; // 🔧 NEW
     console.log('%c🗑️ Key cleared from all storage layers', 'color:#FFB300;font-weight:bold');
   };
 
@@ -474,7 +529,34 @@ if (typeof window !== 'undefined') {
         console.log('   HTTP status:', res.status);
       } else if (Array.isArray(data?.models)) {
         console.log(`%c✅ Key works — ${data.models.length} Gemini models available`, 'color:#00E676; font-weight:bold');
-        console.log(`   Validator will use model: ${GEMINI_MODEL}`);
+
+        // 🔧 NEW: List which of our preferred models Google actually supports right now.
+        const availableNames = data.models
+          .map((m: any) => String(m?.name || '').replace(/^models\//, ''))
+          .filter(Boolean);
+
+        console.log('%c🔎 Validator preference check:', 'color:#9D4EDD; font-weight:bold');
+        for (const pref of GEMINI_MODEL_FALLBACKS) {
+          const isAvailable = availableNames.includes(pref);
+          const mark = isAvailable ? '✅' : '❌';
+          const color = isAvailable ? 'color:#00E676' : 'color:#FF3366';
+          console.log(`%c   ${mark} ${pref}`, color);
+        }
+
+        const firstWorking = GEMINI_MODEL_FALLBACKS.find((m) => availableNames.includes(m));
+        if (firstWorking) {
+          console.log(
+            `%c🎯 Validator will use: ${firstWorking}`,
+            'color:#00E676; font-weight:bold'
+          );
+        } else {
+          console.log(
+            '%c⚠️ NONE of the preferred models are available! Update GEMINI_MODEL_FALLBACKS.',
+            'color:#FF3366; font-weight:bold'
+          );
+          console.log('   Available models on your key:');
+          console.log('  ', availableNames.slice(0, 20).join(', '));
+        }
       } else {
         console.log('⚠️ Unexpected response shape:', data);
       }
