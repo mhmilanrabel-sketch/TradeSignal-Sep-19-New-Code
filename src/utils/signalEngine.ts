@@ -1,3 +1,4 @@
+// src/utils/signalEngine.ts
 import { CandleData } from '../types';
 import botConfig from '../config/botConfig.json';
 
@@ -72,11 +73,31 @@ export interface ConfluenceScore {
   };
 }
 
-// Minimum ATR as % of price. Below this → chop, reject trade entirely.
-const MIN_ATR_PCT = 0.0030;   // 0.30% per 5m bar — filters chop better than 0.25%
-const MAX_ATR_PCT = 0.02;     // 2.0% per 5m bar — above this = violent, reject
+// ═══════════════════════════════════════════════════════════════════════════
+// Per-symbol ATR thresholds.
+// Values stored as DECIMALS (0.0018 = 0.18%).
+// Omitting `symbol` falls back to 0.30% for backward compatibility.
+// ═══════════════════════════════════════════════════════════════════════════
+const MIN_ATR_PCT_BY_SYMBOL: Record<string, number> = {
+  'BTC/USDT':  0.0018,   // 0.18% — BTC is a low-vol major
+  'ETH/USDT':  0.0020,   // 0.20% — ETH slightly more active than BTC
+  'SOL/USDT':  0.0028,   // 0.28% — SOL is high-beta
+  'BNB/USDT':  0.0022,   // 0.22%
+  'XRP/USDT':  0.0035,   // 0.35% — XRP wicks a lot
+  'ADA/USDT':  0.0030,   // 0.30%
+  'DOGE/USDT': 0.0040,   // 0.40% — DOGE needs real momentum
+  'AVAX/USDT': 0.0035,   // 0.35%
+  'LINK/USDT': 0.0030,   // 0.30%
+  'DOT/USDT':  0.0030,   // 0.30%
+};
 
-export function scoreConfluence(candles: CandleData[]): ConfluenceScore {
+const DEFAULT_MIN_ATR_PCT = 0.0030;   // 0.30% fallback
+const MAX_ATR_PCT = 0.02;             // 2.0% per 5m bar — above this = violent, reject
+
+export function scoreConfluence(
+  candles: CandleData[],
+  symbol?: string,
+): ConfluenceScore {
   if (candles.length < 30) {
     return {
       total: 0,
@@ -110,13 +131,21 @@ export function scoreConfluence(candles: CandleData[]): ConfluenceScore {
 
   const reasons: string[] = [];
 
+  const minAtrPct =
+    symbol && MIN_ATR_PCT_BY_SYMBOL[symbol] !== undefined
+      ? MIN_ATR_PCT_BY_SYMBOL[symbol]
+      : DEFAULT_MIN_ATR_PCT;
+
   // ---- HARD REJECT on bad volatility regimes ----
   if (atrPct > 0) {
-    if (atrPct < MIN_ATR_PCT) {
+    if (atrPct < minAtrPct) {
       return {
         total: 0,
         direction: 'NONE',
-        reasons: [`ATR too quiet (${(atrPct * 100).toFixed(3)}% < ${(MIN_ATR_PCT * 100).toFixed(2)}%) — chop, reject`],
+        reasons: [
+          `ATR too quiet (${(atrPct * 100).toFixed(3)}% < ${(minAtrPct * 100).toFixed(2)}%` +
+          `${symbol ? ` [${symbol}]` : ''}) — chop, reject`,
+        ],
         indicators: { emaFast: e20, emaSlow: e50, emaTrend: e200, rsi: r, atr: a, atrPct, volumeRatio: volRatio },
       };
     }
@@ -197,9 +226,6 @@ export function isInKillZone(): { ok: boolean; name: string; weight: number } {
 
 // ----------------------------------------------------------------------------
 // ATR-scaled TP / SL
-//   ✏️ #1 FIX: SL multiplier was 1.2 — INSIDE the noise band of 5m wicks.
-//      Widened to 2.2 → SL sits outside normal pullback ranges.
-//      TP auto-scales: TP1 = slDist × min_reward_risk_ratio (unchanged)
 // ----------------------------------------------------------------------------
 
 export function buildRiskLevels(
@@ -208,8 +234,8 @@ export function buildRiskLevels(
   atrValue: number,
   cfg = botConfig.risk_engine,
 ) {
-  const slDist = atrValue * 2.2;                      // ← was 1.2, now 2.2
-  const tp1Dist = slDist * cfg.min_reward_risk_ratio; // unchanged math
+  const slDist = atrValue * 2.2;
+  const tp1Dist = slDist * cfg.min_reward_risk_ratio;
   const tp2Dist = tp1Dist * 1.6;
   const isLong = direction === 'LONG';
   return {

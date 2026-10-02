@@ -66,10 +66,8 @@ const MIN_CONFLUENCE_SCORE = 70;
 const MIN_KILLZONE_WEIGHT = 0.3;
 const SKIP_KILLZONE_DEFAULT = true;
 
-// Weekend trading filter.
 const SKIP_WEEKENDS = true;
 
-// $100 LIVE MODE constants
 const MAX_ACTIVE_TRADES = 2;
 const MAX_SAME_DIRECTION = 1;
 const MAX_MARGIN_USE_PCT = 20;
@@ -84,20 +82,57 @@ const FUNDING_CACHE_TTL_MS = 10 * 60_000;
 const USER_STREAM_KEEPALIVE_MS = 25 * 60_000;
 const MAX_ENTRY_DRIFT_PCT = 0.010;
 
-const TIME_STOP_MS = 30 * 60_000;
+// 🔧 CHANGED: 30 min → 60 min so TP1 has a realistic chance to be hit
+const TIME_STOP_MS = 60 * 60_000;
+
 const TIME_STOP_MIN_PNL = -0.5;
 const TIME_STOP_MAX_PNL = 0.3;
 
-// 🔧 NEW: Sustained-offline threshold before the kill switch trips.
-//    Short network blips (<5 min) are silently retried — no manual clear needed.
 const NETWORK_OFFLINE_KILL_THRESHOLD_MS = 5 * 60_000;
 
-// Signals array pruning: keep ACTIVE + last N CLOSED to prevent bloat.
 const SIGNALS_KEEP_CLOSED = 20;
 
-// ═══════════════════════════════════════════════════════════════════════════
-// MARKET DATA WEBSOCKET — module-level singleton
-// ═══════════════════════════════════════════════════════════════════════════
+const SCAN_WHITELIST = new Set<string>([
+  'BTC/USDT', 'ETH/USDT', 'SOL/USDT',
+  'BNB/USDT', 'XRP/USDT', 'ADA/USDT',
+  'DOGE/USDT', 'AVAX/USDT', 'LINK/USDT', 'DOT/USDT',
+]);
+
+const MIN_ATR_PCT_BY_SYMBOL: Record<string, number> = {
+  'BTC/USDT':  0.0018,
+  'ETH/USDT':  0.0020,
+  'SOL/USDT':  0.0028,
+  'BNB/USDT':  0.0022,
+  'XRP/USDT':  0.0035,
+  'ADA/USDT':  0.0030,
+  'DOGE/USDT': 0.0040,
+  'AVAX/USDT': 0.0035,
+  'LINK/USDT': 0.0030,
+  'DOT/USDT':  0.0030,
+};
+const DEFAULT_MIN_ATR_PCT = 0.0030;
+
+function getCandleVolume(c: any): number {
+  if (!c) return 0;
+  if (Array.isArray(c)) return parseFloat(c[5] ?? '0') || 0;
+  return parseFloat(c.volume ?? c.v ?? '0') || 0;
+}
+
+function hasVolumeConfirmation(
+  candles: any[],
+  lookbackShort: number = 3,
+  lookbackLong: number = 20,
+  multiplier: number = 1.2,
+): { ok: boolean; shortAvg: number; longAvg: number } {
+  if (candles.length < lookbackLong) return { ok: false, shortAvg: 0, longAvg: 0 };
+  const recent = candles.slice(-lookbackShort);
+  const baseline = candles.slice(-lookbackLong);
+  const shortAvg = recent.reduce((s, c) => s + getCandleVolume(c), 0) / recent.length;
+  const longAvg = baseline.reduce((s, c) => s + getCandleVolume(c), 0) / baseline.length;
+  const ok = longAvg > 0 && shortAvg >= longAvg * multiplier;
+  return { ok, shortAvg, longAvg };
+}
+
 const MARKET_WS_URLS = [
   'wss://stream.binance.com:9443/ws/!miniTicker@arr',
   'wss://data-stream.binance.vision/ws/!miniTicker@arr',
@@ -107,13 +142,6 @@ let __marketWs: WebSocket | null = null;
 let __marketWsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let __marketWsUrlIndex = 0;
 
-const SCAN_WHITELIST = new Set<string>([
-  'BTC/USDT', 'ETH/USDT', 'SOL/USDT',
-]);
-
-// ═══════════════════════════════════════════════════════════════════════════
-// DEBUG BRIDGE
-// ═══════════════════════════════════════════════════════════════════════════
 if (typeof window !== 'undefined') {
   (window as any).__signalEngine = {
     scoreConfluence,
@@ -122,7 +150,7 @@ if (typeof window !== 'undefined') {
     isInKillZone,
   };
   console.log(
-    '%c🧪 Debug bridge ready — try: window.__signalEngine.scoreConfluence([...])',
+    '%c🧪 Debug bridge ready — try: window.__signalEngine.scoreConfluence([...], "BTC/USDT")',
     'color:#9D4EDD;font-style:italic'
   );
 }
@@ -319,7 +347,6 @@ export const App: React.FC = () => {
     localStorage.getItem('tradesignal_kill_switch') === '1'
   );
 
-  // 🔧 NEW: Track transient network outages so we can show a banner without tripping kill switch.
   const [networkOffline, setNetworkOffline] = useState<boolean>(false);
 
   const [accountSnapshot, setAccountSnapshot] = useState<AccountSnapshot | null>(null);
@@ -373,8 +400,6 @@ export const App: React.FC = () => {
   const consecutiveFailuresRef = useRef<number>(0);
   const apiSettingsRef = useRef(apiSettings);
 
-  // 🔧 NEW: Track consecutive network failures + last successful balance fetch.
-  //    Kill switch only trips after NETWORK_OFFLINE_KILL_THRESHOLD_MS of continuous outage.
   const networkFailureStreakRef = useRef<number>(0);
   const lastSuccessfulBalanceRef = useRef<number>(Date.now());
 
@@ -423,9 +448,9 @@ export const App: React.FC = () => {
     setKillSwitchOn(false);
     localStorage.removeItem('tradesignal_kill_switch');
     consecutiveFailuresRef.current = 0;
-    networkFailureStreakRef.current = 0; // 🔧 NEW: reset network tracker too
-    lastSuccessfulBalanceRef.current = Date.now(); // 🔧 NEW
-    setNetworkOffline(false); // 🔧 NEW
+    networkFailureStreakRef.current = 0;
+    lastSuccessfulBalanceRef.current = Date.now();
+    setNetworkOffline(false);
     setConnectionLog('✅ Kill switch cleared. Trading may resume.');
   };
 
@@ -452,7 +477,6 @@ export const App: React.FC = () => {
     signalsRef.current = signalsRef.current.map((s) => (s.id === id ? { ...s, ...patch } : s));
   };
 
-  // Prune signals: keep ACTIVE + most recent N CLOSED, drop the rest.
   const pruneSignals = (arr: TradeSignal[]): TradeSignal[] => {
     const active = arr.filter((s) => s.status === 'ACTIVE');
     const closed = arr
@@ -496,13 +520,6 @@ export const App: React.FC = () => {
     return Number(rounded.toFixed(decimals));
   };
 
-  // ═════════════════════════════════════════════════════════════════════════
-  // 🔧 MODIFIED: refreshAccountSnapshot — network-aware failure handling.
-  //    - Silent retries on short network blips (<5 min) — no kill switch, no manual clear
-  //    - Kill switch only trips after sustained 5-minute outage
-  //    - Auth/API errors still return null but do NOT increment the offline streak
-  //    - networkOffline state drives a UI banner
-  // ═════════════════════════════════════════════════════════════════════════
   const refreshAccountSnapshot = async (): Promise<AccountSnapshot | null> => {
     if (!apiSettings.apiKey || !apiSettings.apiSecret || !apiSettings.enableFutures) return null;
     const baseUrl = getBaseUrl(apiSettings.environment, true);
@@ -530,7 +547,6 @@ export const App: React.FC = () => {
       accountSnapshotRef.current = snapshot;
       setApiSettings((prev) => ({ ...prev, usdtBalance: snapshot.availableBalance }));
 
-      // 🔧 NEW: Reset offline tracking on any success.
       networkFailureStreakRef.current = 0;
       lastSuccessfulBalanceRef.current = Date.now();
       setNetworkOffline(false);
@@ -539,7 +555,6 @@ export const App: React.FC = () => {
     } catch (err: any) {
       console.warn('[balance] network err', err.message);
 
-      // 🔧 NEW: Classify the failure. Only network errors count toward offline streak.
       const msg = String(err?.message ?? '');
       const isNetworkErr =
         msg.includes('Failed to fetch') ||
@@ -558,7 +573,6 @@ export const App: React.FC = () => {
           `[balance] network down (streak ${networkFailureStreakRef.current}, offline ${offlineSec}s)`
         );
 
-        // 🔧 NEW: Only trip the kill switch after sustained outage.
         if (offlineMs >= NETWORK_OFFLINE_KILL_THRESHOLD_MS && !killSwitchRef.current) {
           tripKillSwitch(
             `Network offline for ${Math.round(offlineMs / 60000)} min — cannot verify balance`
@@ -1319,9 +1333,6 @@ export const App: React.FC = () => {
     };
   };
 
-  // ═════════════════════════════════════════════════════════════════════════
-  // USER DATA STREAM
-  // ═════════════════════════════════════════════════════════════════════════
   useEffect(() => {
     if (!apiSettings.apiKey || !apiSettings.enableFutures) return;
     if (listenKeyFatalRef.current) return;
@@ -1566,7 +1577,6 @@ export const App: React.FC = () => {
       const startStr = `${formatStartTime(startTimeMs)} UTC`;
       const now = Date.now();
       const suffix = Math.random().toString(36).substring(2, 6);
-      // ✅ FIX: store ISO string so the display layer can format relative dates.
       const closedAtStr = new Date(now).toISOString();
       const pnlPipsOrPoints = Number(Math.abs(exitPrice - trade.entryPrice).toFixed(4));
       const newRecord: ClosedSignal = {
@@ -1580,7 +1590,6 @@ export const App: React.FC = () => {
       const saved = localStorage.getItem('tradesignal_closed_signals_journal');
       let current: ClosedSignal[] = [];
       if (saved) { try { const parsed = JSON.parse(saved); if (Array.isArray(parsed)) current = parsed; } catch { current = []; } }
-      // Dedup by id when merging.
       const seen = new Set<string>();
       const merged: ClosedSignal[] = [];
       for (const item of [newRecord, ...current]) {
@@ -1632,6 +1641,7 @@ ${items.join('\n\n')}
     setTimeout(() => setCopiedAllTrades(false), 2000);
   };
 
+  // MAIN SCAN — per-symbol ATR, 4h bias filter, volume confirmation
   const handleExecuteCryptoScalpScan = async () => {
     console.log('[SCAN] ========== Scan starting ==========');
     if (killSwitchRef.current) {
@@ -1686,9 +1696,6 @@ ${items.join('\n\n')}
       snapshot = await refreshAccountSnapshot();
     }
 
-    // 🔧 MODIFIED: Balance unknown → quiet skip. The kill switch is now owned by
-    //    refreshAccountSnapshot (5-min sustained-outage threshold), NOT by this
-    //    scan loop. Short network blips must NOT halt the bot.
     if (!snapshot) {
       setConnectionLog('⛔ Balance unknown — scan skipped (network).');
       return;
@@ -1743,6 +1750,9 @@ ${items.join('\n\n')}
     const newPositions: TradeSignal[] = [];
     let longsQueued = 0, shortsQueued = 0;
     const aiMultiplierMap: Record<string, number> = {};
+    let rejectedAtAtr = 0;
+    let rejectedAt4h = 0;
+    let rejectedAtVolume = 0;
 
     for (const { asset, candles, error } of candleResults) {
       if (newPositions.length >= slots) break;
@@ -1758,20 +1768,16 @@ ${items.join('\n\n')}
         continue;
       }
 
-      const confluence = scoreConfluence(candles);
+      const confluence = scoreConfluence(candles, asset.symbol);
       console.log(`[SCAN] ${asset.symbol}: 5m score=${confluence.total.toFixed(0)} dir=${confluence.direction} | ${confluence.reasons.join(', ')}`);
 
-      if (confluence.total >= 50 && confluence.total < MIN_CONFLUENCE_SCORE) {
-        const shortLeaning = confluence.reasons.some((r) => {
-          const lower = r.toLowerCase();
-          return lower.includes('bearish')
-            || lower.includes('price < ema50')
-            || (lower.includes('vol') && lower.includes('bear'));
-        });
-        if (shortLeaning) {
+      if (confluence.total === 0 && confluence.direction === 'NONE') {
+        const symbolThreshold = MIN_ATR_PCT_BY_SYMBOL[asset.symbol] ?? DEFAULT_MIN_ATR_PCT;
+        const detectedAtrPct = confluence.indicators?.atrPct ?? 0;
+        if (detectedAtrPct > 0 && detectedAtrPct < symbolThreshold) {
+          rejectedAtAtr++;
           console.log(
-            `[SCAN] ${asset.symbol}: [SHORT-WATCH] 5m=${confluence.total.toFixed(0)} — below ${MIN_CONFLUENCE_SCORE} threshold. ` +
-            confluence.reasons.join(', ')
+            `[SCAN] ${asset.symbol}: [ATR-HINT] detected ${(detectedAtrPct * 100).toFixed(3)}% vs desired ${(symbolThreshold * 100).toFixed(2)}%`
           );
         }
       }
@@ -1783,15 +1789,8 @@ ${items.join('\n\n')}
         console.log(`[SCAN] ${asset.symbol}: ⏸ 15m candles insufficient (${candles15m.length})`);
         continue;
       }
-      const trend15m = scoreConfluence(candles15m);
+      const trend15m = scoreConfluence(candles15m, asset.symbol);
       console.log(`[SCAN] ${asset.symbol}: 15m score=${trend15m.total.toFixed(0)} dir=${trend15m.direction}`);
-
-      if (confluence.direction === 'SHORT' && trend15m.direction !== 'SHORT') {
-        console.log(
-          `[SCAN] ${asset.symbol}: [SHORT-CANDIDATE] 5m=${confluence.total.toFixed(0)} SHORT, ` +
-          `but 15m=${trend15m.total.toFixed(0)} ${trend15m.direction} — 15m trend gate blocked it`
-        );
-      }
 
       if (confluence.direction === 'LONG' && trend15m.direction !== 'LONG') {
         console.log(`[SCAN] ${asset.symbol}: ❌ rejected — 5m LONG but 15m is ${trend15m.direction}`);
@@ -1806,7 +1805,7 @@ ${items.join('\n\n')}
       let trend1h: { total: number; direction: 'LONG' | 'SHORT' | 'NONE'; reasons: string[] } =
         { total: 0, direction: 'NONE', reasons: [] };
       if (candles1h.length >= 30) {
-        trend1h = scoreConfluence(candles1h);
+        trend1h = scoreConfluence(candles1h, asset.symbol);
         console.log(`[SCAN] ${asset.symbol}: 1h score=${trend1h.total.toFixed(0)} dir=${trend1h.direction}`);
         if (confluence.direction === 'LONG' && trend1h.direction === 'SHORT') {
           console.log(`[SCAN] ${asset.symbol}: ❌ rejected — 5m LONG against 1h SHORT`);
@@ -1816,6 +1815,35 @@ ${items.join('\n\n')}
           console.log(`[SCAN] ${asset.symbol}: ❌ rejected — 5m SHORT against 1h LONG`);
           continue;
         }
+      }
+
+      // 4H BIAS FILTER
+      const { candles: candles4h } = await getRealCandles(asset.symbol, '4h', 60);
+      if (candles4h.length >= 30) {
+        const trend4h = scoreConfluence(candles4h, asset.symbol);
+        console.log(`[SCAN] ${asset.symbol}: 4h score=${trend4h.total.toFixed(0)} dir=${trend4h.direction}`);
+        if (confluence.direction === 'LONG' && trend4h.direction === 'SHORT') {
+          console.log(`[SCAN] ${asset.symbol}: ❌ rejected — 5m LONG against 4h SHORT`);
+          rejectedAt4h++;
+          continue;
+        }
+        if (confluence.direction === 'SHORT' && trend4h.direction === 'LONG') {
+          console.log(`[SCAN] ${asset.symbol}: ❌ rejected — 5m SHORT against 4h LONG`);
+          rejectedAt4h++;
+          continue;
+        }
+      }
+
+      // VOLUME CONFIRMATION
+      const vol = hasVolumeConfirmation(candles, 3, 20, 1.2);
+      console.log(
+        `[SCAN] ${asset.symbol}: volume check — short(3)=${vol.shortAvg.toFixed(2)} long(20)=${vol.longAvg.toFixed(2)} ` +
+        `ratio=${vol.longAvg > 0 ? (vol.shortAvg / vol.longAvg).toFixed(2) : '0.00'} → ${vol.ok ? 'PASS' : 'FAIL'}`
+      );
+      if (!vol.ok) {
+        console.log(`[SCAN] ${asset.symbol}: ❌ rejected — volume confirmation failed`);
+        rejectedAtVolume++;
+        continue;
       }
 
       if (confluence.direction === 'LONG' && longsQueued >= longSlots) continue;
@@ -1838,11 +1866,6 @@ ${items.join('\n\n')}
       let aiReasoning = '';
 
       const aiCanRun = aiValidatorEnabled && isAiValidatorConfigured();
-      if (aiValidatorEnabled && !isAiValidatorConfigured()) {
-        console.log(
-          `[AI] ${asset.symbol}: skipped (no Gemini key loaded — rules-only mode)`
-        );
-      }
 
       if (aiCanRun && confluence.total >= MIN_CONFLUENCE_SCORE) {
         const recentTrades: AiRecentTrade[] = signals
@@ -1945,7 +1968,8 @@ ${items.join('\n\n')}
 
     console.log(
       `[SCAN] Evaluation complete. Qualified setups: ${newPositions.length} ` +
-      `(longsQueued=${longsQueued}, shortsQueued=${shortsQueued}, slots=${slots})`
+      `(longsQueued=${longsQueued}, shortsQueued=${shortsQueued}, slots=${slots}) ` +
+      `| rejected: ATR-hint=${rejectedAtAtr} 4h-filter=${rejectedAt4h} vol-filter=${rejectedAtVolume}`
     );
 
     if (!newPositions.length) {
@@ -2095,14 +2119,6 @@ ${items.join('\n\n')}
   const scanFnRef = useRef(handleExecuteCryptoScalpScan);
   useEffect(() => { scanFnRef.current = handleExecuteCryptoScalpScan; });
 
-  // ═════════════════════════════════════════════════════════════════════════
-  // STARTUP JOBS — Run once per app load, in sequence:
-  //   1. Prune signals array (housekeeping)           — instant
-  //   2. Wait 5s for React hydration
-  //   3. Orphan detection (Binance positions not in app)
-  //   4. SL repair (fix corrupted SL for active trades)
-  //   5. Phantom reconciliation (close signals not on Binance)
-  // ═════════════════════════════════════════════════════════════════════════
   const orphanCheckRanRef = useRef(false);
   useEffect(() => {
     if (!apiSettings.apiKey || !apiSettings.apiSecret || !apiSettings.enableFutures) return;
@@ -2111,7 +2127,6 @@ ${items.join('\n\n')}
 
     (async () => {
       try {
-        // ── JOB 1: Prune signals array (housekeeping) ──
         const beforePrune = signalsRef.current.length;
         const pruned = pruneSignals(signalsRef.current);
         if (pruned.length !== beforePrune) {
@@ -2120,10 +2135,8 @@ ${items.join('\n\n')}
           console.log(`[PRUNE] signals: ${beforePrune} → ${pruned.length}`);
         }
 
-        // Wait 5s for hydration
         await new Promise((r) => setTimeout(r, 5000));
 
-        // ── JOB 2: Orphan detection ──
         const open = await getAllOpenPositions();
         if (open.length === 0) {
           console.log('[orphan] no open positions on Binance');
@@ -2162,7 +2175,6 @@ ${items.join('\n\n')}
           }
         }
 
-        // ── JOB 3: SL repair ──
         const activeWithNativeSl = signalsRef.current.filter((s) =>
           s.status === 'ACTIVE' &&
           s.binanceSlOrderId &&
@@ -2193,7 +2205,6 @@ ${items.join('\n\n')}
           }
         }
 
-        // ── JOB 4: Phantom reconciliation ──
         const openPositions = await getAllOpenPositions();
         const openSymbols = new Set(openPositions.map((p) => p.symbol));
 
@@ -2324,9 +2335,6 @@ ${items.join('\n\n')}
     setIsClosingOrphans(false);
   };
 
-  // ═════════════════════════════════════════════════════════════════════════
-  // REDUCE-ONLY CLOSER
-  // ═════════════════════════════════════════════════════════════════════════
   useEffect(() => {
     if (!apiSettings.apiKey || !apiSettings.apiSecret) return;
     const justClosed = signals.filter(
@@ -2367,9 +2375,6 @@ ${items.join('\n\n')}
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [signals, apiSettings.apiKey, apiSettings.apiSecret]);
 
-  // ═════════════════════════════════════════════════════════════════════════
-  // TIME STOP
-  // ═════════════════════════════════════════════════════════════════════════
   useEffect(() => {
     if (!apiSettings.apiKey || !apiSettings.apiSecret || !apiSettings.enableFutures) return;
 
@@ -2461,9 +2466,6 @@ ${items.join('\n\n')}
     return () => clearInterval(backgroundInterval);
   }, [isAutoPilotActive]);
 
-  // ═════════════════════════════════════════════════════════════════════════
-  // MARKET DATA STREAM
-  // ═════════════════════════════════════════════════════════════════════════
   useEffect(() => {
     let cancelled = false;
 
@@ -2521,7 +2523,6 @@ ${items.join('\n\n')}
             ? ((livePrice - sig.entryPrice) / (sig.entryPrice || 1)) * 100
             : ((sig.entryPrice - livePrice) / (sig.entryPrice || 1)) * 100;
 
-          // TRAILING FIX: skip when Binance holds a native algo SL.
           const hasNativeStopHere = Boolean(sig.binanceSlOrderId && sig.binanceTpOrderId);
           let sl = sig.stopLoss;
           if (!hasNativeStopHere &&
@@ -2734,7 +2735,6 @@ ${items.join('\n\n')}
         </div>
       )}
 
-      {/* 🔧 NEW: Network offline banner (transient — auto-clears on recovery). */}
       {networkOffline && !killSwitchOn && (
         <div className="bg-amber-600/20 border-b-2 border-amber-500 px-4 py-2 text-[12px] font-mono text-amber-100 flex items-center justify-between gap-3">
           <div className="flex items-center gap-2">
@@ -2888,6 +2888,12 @@ ${items.join('\n\n')}
                     <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-sky-500/20 text-sky-300 border border-sky-500/30">
                       TIME STOP {Math.round(TIME_STOP_MS / 60000)}m
                     </span>
+                    <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">
+                      4H GATE ON
+                    </span>
+                    <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-teal-500/20 text-teal-300 border border-teal-500/30">
+                      VOL FILTER 1.2×
+                    </span>
                     {aiValidatorEnabled && (
                       <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-purple-500/20 text-purple-300 border border-purple-500/30 flex items-center gap-1">
                         <Brain className="w-3 h-3" />
@@ -2896,7 +2902,7 @@ ${items.join('\n\n')}
                     )}
                   </div>
                   <p className="text-[11px] text-slate-400 mt-0.5">
-                    Confluence ≥ {MIN_CONFLUENCE_SCORE} · 15m/1h trend gates · Real Binance Klines · ATR-scaled SL/TP · R:R 1:{botConfig.risk_engine.min_reward_risk_ratio}
+                    Confluence ≥ {MIN_CONFLUENCE_SCORE} · 5m/15m/1h/4h gates · Volume confirm · Per-symbol ATR · ATR-scaled SL/TP · R:R 1:{botConfig.risk_engine.min_reward_risk_ratio}
                   </p>
                 </div>
               </div>
@@ -3293,7 +3299,6 @@ ${items.join('\n\n')}
               <div className="text-[11px] text-slate-400 space-y-1 font-mono">
                 <div>✅ Leverage set on Binance once per symbol ({botConfig.binance_config.leverage}x)</div>
                 <div>✅ Margin type set to ISOLATED</div>
-                <div>✅ Margin-type pre-check avoids -4046 400 responses</div>
                 <div>✅ Algo SL/TP via /fapi/v1/algoOrder</div>
                 <div>✅ Stale algo orders cancelled before every new attach</div>
                 <div>✅ Hard block if balance unknown or stale (&gt;60s)</div>
@@ -3301,40 +3306,21 @@ ${items.join('\n\n')}
                 <div>✅ Free-margin guard: ≤{MAX_MARGIN_USE_PCT}% of available per order</div>
                 <div>✅ Emergency close if SL/TP attach fails (no naked positions)</div>
                 <div>✅ Kill switch tripped by -{MAX_DAILY_LOSS_PCT}% daily loss, {MAX_CONSECUTIVE_FAILURES} order failures, or manual</div>
-                <div>✅ Balance re-read between every order in a batch</div>
-                <div>✅ Quantity floored to LOT_SIZE, triggerPrice to PRICE_FILTER</div>
-                <div>✅ Fill price resolved from /fapi/v1/order when POST omits avgPrice</div>
                 <div>✅ Price-drift guard: skip entries if price moved &gt;{(MAX_ENTRY_DRIFT_PCT * 100).toFixed(1)}% since scoring</div>
-                <div>✅ Position-exists guard</div>
-                <div>✅ Pre-close check avoids -2022 ReduceOnly rejections</div>
                 <div>✅ ATR-scaled SL at 2.2× (outside noise band)</div>
                 <div>✅ Funding-rate crowding filter (|funding| &gt; {(FUNDING_CROWDED_THRESHOLD * 100).toFixed(3)}%)</div>
-                <div>✅ 15m + 1h trend confirmation gates</div>
+                <div>✅ 5m + 15m + 1h trend confirmation gates</div>
                 <div>✅ 15-minute candle-close window (last 30s only)</div>
-                <div>✅ Side-effects extracted from state updaters (StrictMode-safe)</div>
-                <div>✅ signalsRef mirrored synchronously via addSignals/removeSignal/patchSignal</div>
-                <div>✅ User-stream keep-alive every 25 min with automatic reconnect</div>
-                <div>✅ Daily-P&amp;L gate triggers on drawdown only</div>
-                <div>✅ AI-unavailable warning surfaced once per session</div>
-                <div>✅ AI short-circuit when no key loaded</div>
-                <div>✅ Orphan rescue: 5s mount delay + full diagnostic logging</div>
-                <div>✅ Orphan close: requires explicit window.confirm()</div>
-                <div>✅ FORCE SCAN disabled while orphans exist</div>
-                <div>✅ $100 MODE: direction cap = {MAX_SAME_DIRECTION}/side, max {MAX_ACTIVE_TRADES} concurrent</div>
-                <div>✅ $100 MODE: margin ≤ {MAX_MARGIN_USE_PCT}% per trade, whitelist = {SCAN_WHITELIST.size} liquid majors</div>
-                <div>✅ $100 MODE: SL cooldown = {Math.round(COOLDOWN_AFTER_SL_MS / 60000)}min, max {MAX_ENTRIES_PER_SYMBOL_PER_DAY} entries/symbol/day</div>
-                <div>✅ Time stop: dead 5m scalps recycled after {Math.round(TIME_STOP_MS / 60000)}m</div>
-                <div>✅ FIX: Trailing SL disabled for trades with Binance algo SL</div>
-                <div>✅ FIX: SL REPAIR on startup — syncs sig.stopLoss with Binance trigger</div>
-                <div>✅ FIX: Phantom reconciliation — auto-closes signals not on Binance</div>
-                <div>✅ FIX: Signals array pruned to keep ACTIVE + last {SIGNALS_KEEP_CLOSED} CLOSED</div>
-                <div>✅ FIX: Journal date display computed from timestamp (no more frozen "Today")</div>
-                {/* 🔧 NEW: This batch */}
-                <div>✅ <strong>NEW: Network-aware kill switch — short blips (&lt;{Math.round(NETWORK_OFFLINE_KILL_THRESHOLD_MS / 60000)}min) are silently retried, no manual clear needed</strong></div>
-                <div>✅ <strong>NEW: Offline banner shows streak + auto-clears on first successful balance fetch</strong></div>
-                <div>✅ <strong>NEW: Balance-fail kill switch removed from scan loop — only 5-min sustained outage trips it</strong></div>
+                <div>✅ Network-aware kill switch — short blips (&lt;{Math.round(NETWORK_OFFLINE_KILL_THRESHOLD_MS / 60000)}min) are silently retried</div>
+                <div>✅ Phantom reconciliation — auto-closes signals not on Binance</div>
+                <div>✅ 4h bias filter — rejects counter-trend 5m setups</div>
+                <div>✅ Volume confirmation — last 3 candles ≥ 1.2× 20-candle avg</div>
+                <div>✅ Expanded whitelist — {SCAN_WHITELIST.size} liquid symbols</div>
+                <div>✅ Per-symbol ATR thresholds — BTC 0.18% / ETH 0.20% / SOL 0.28% / alts 0.30–0.40%</div>
+                <div>✅ <strong>TIME STOP extended 30m → {Math.round(TIME_STOP_MS / 60000)}m (gives TP1 room to hit)</strong></div>
+                <div>✅ <strong>R:R lowered 2.5 → {botConfig.risk_engine.min_reward_risk_ratio} (realistic TP target)</strong></div>
+                <div>✅ Gemini AI Validator model: gemini-3.8-flash (with fallbacks)</div>
                 <div>✅ WEEKEND FILTER: {SKIP_WEEKENDS ? 'ON — no new entries Sat/Sun UTC' : 'OFF'}</div>
-                <div>✅ SHORT-WATCH + SHORT-CANDIDATE diagnostics in console</div>
                 <div>{aiValidatorEnabled && isAiValidatorConfigured() ? '✅ AI Trade Validator ON' : aiValidatorEnabled ? '⚠️ AI Validator ON but no key — running rules-only' : '⏸ AI Trade Validator OFF'}</div>
               </div>
             </div>
@@ -3354,9 +3340,14 @@ ${items.join('\n\n')}
             <div className="border-t border-slate-800 pt-5">
               <h4 className="text-xs font-bold text-white mb-2">Whitelisted Symbols ({SCAN_WHITELIST.size})</h4>
               <div className="flex flex-wrap gap-1.5">
-                {Array.from(SCAN_WHITELIST).map((sym) => (
-                  <span key={sym} className="px-2 py-0.5 rounded text-[10px] font-mono bg-emerald-500/10 text-emerald-300 border border-emerald-500/30">{sym}</span>
-                ))}
+                {Array.from(SCAN_WHITELIST).map((sym) => {
+                  const thr = MIN_ATR_PCT_BY_SYMBOL[sym] ?? DEFAULT_MIN_ATR_PCT;
+                  return (
+                    <span key={sym} className="px-2 py-0.5 rounded text-[10px] font-mono bg-emerald-500/10 text-emerald-300 border border-emerald-500/30">
+                      {sym} <span className="text-emerald-500/70">·{(thr * 100).toFixed(2)}%</span>
+                    </span>
+                  );
+                })}
               </div>
             </div>
           </div>
