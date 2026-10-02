@@ -96,6 +96,9 @@ const RECONCILE_INTERVAL_MS = 2 * 60_000;
 const LS_DAILY_PNL_KEY = 'tradesignal_daily_pnl';
 const LS_DAILY_ENTRY_COUNT_KEY = 'tradesignal_daily_entry_count';
 
+// 🔧 VOLUME FIX: 1.2 → 1.0 (was killing normal-volume trend starts)
+const VOLUME_CONFIRMATION_MULTIPLIER = 1.0;
+
 const SCAN_WHITELIST = new Set<string>([
   'BTC/USDT', 'ETH/USDT', 'SOL/USDT',
   'BNB/USDT', 'XRP/USDT', 'ADA/USDT',
@@ -126,7 +129,7 @@ function hasVolumeConfirmation(
   candles: any[],
   lookbackShort: number = 3,
   lookbackLong: number = 20,
-  multiplier: number = 1.2,
+  multiplier: number = VOLUME_CONFIRMATION_MULTIPLIER,
 ): { ok: boolean; shortAvg: number; longAvg: number } {
   if (candles.length < lookbackLong) return { ok: false, shortAvg: 0, longAvg: 0 };
   const recent = candles.slice(-lookbackShort);
@@ -2010,7 +2013,7 @@ ${items.join('\n\n')}
         }
       }
 
-      const vol = hasVolumeConfirmation(candles, 3, 20, 1.2);
+      const vol = hasVolumeConfirmation(candles, 3, 20, VOLUME_CONFIRMATION_MULTIPLIER);
       console.log(
         `[SCAN] ${asset.symbol}: volume check — short(3)=${vol.shortAvg.toFixed(2)} long(20)=${vol.longAvg.toFixed(2)} ` +
         `ratio=${vol.longAvg > 0 ? (vol.shortAvg / vol.longAvg).toFixed(2) : '0.00'} → ${vol.ok ? 'PASS' : 'FAIL'}`
@@ -3005,7 +3008,7 @@ ${items.join('\n\n')}
                       4H GATE ON
                     </span>
                     <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-teal-500/20 text-teal-300 border border-teal-500/30">
-                      VOL FILTER 1.2×
+                      VOL FILTER {VOLUME_CONFIRMATION_MULTIPLIER.toFixed(1)}×
                     </span>
                     <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-violet-500/20 text-violet-300 border border-violet-500/30">
                       AUTO-RECONCILE 2m
@@ -3432,13 +3435,13 @@ ${items.join('\n\n')}
                 <div>✅ 15-minute candle-close window (last 30s only)</div>
                 <div>✅ Network-aware kill switch — short blips (&lt;{Math.round(NETWORK_OFFLINE_KILL_THRESHOLD_MS / 60000)}min) are silently retried</div>
                 <div>✅ 4h bias filter — rejects counter-trend 5m setups</div>
-                <div>✅ Volume confirmation — last 3 candles ≥ 1.2× 20-candle avg</div>
+                <div>✅ Volume confirmation — last 3 candles ≥ {VOLUME_CONFIRMATION_MULTIPLIER.toFixed(1)}× 20-candle avg</div>
                 <div>✅ Expanded whitelist — {SCAN_WHITELIST.size} liquid symbols</div>
                 <div>✅ Per-symbol ATR thresholds — BTC 0.18% / ETH 0.20% / SOL 0.28% / alts 0.30–0.40%</div>
                 <div>✅ TIME STOP extended 30m → {Math.round(TIME_STOP_MS / 60000)}m (gives TP1 room to hit)</div>
                 <div>✅ R:R lowered 2.5 → {botConfig.risk_engine.min_reward_risk_ratio} (realistic TP target)</div>
                 <div>✅ AUTO-RECONCILE every {Math.round(RECONCILE_INTERVAL_MS / 60000)}m — detects SL/TP fills that WebSocket missed</div>
-                <div>✅ <strong>PERSISTENT STATE — daily PnL + per-symbol entry caps survive page reload</strong></div>
+                <div>✅ PERSISTENT STATE — daily PnL + per-symbol entry caps survive page reload</div>
                 <div>✅ Gemini AI Validator model: gemini-3.8-flash (fast-fails on 503 overload)</div>
                 <div>✅ WEEKEND FILTER: {SKIP_WEEKENDS ? 'ON — no new entries Sat/Sun UTC' : 'OFF'}</div>
                 <div>{aiValidatorEnabled && isAiValidatorConfigured() ? '✅ AI Trade Validator ON' : aiValidatorEnabled ? '⚠️ AI Validator ON but no key — running rules-only' : '⏸ AI Trade Validator OFF'}</div>
