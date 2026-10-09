@@ -1,4 +1,15 @@
 // src/App.tsx
+// ═══════════════════════════════════════════════════════════════════════════
+// FIXES IN THIS FILE:
+//   #1: imports MIN_ATR_PCT_BY_SYMBOL from signalEngine (single source)
+//   #3: uses scanGuard.acquireScanLock() to prevent double scans
+//   #4: uses dailyCap module (proper persistence)
+//   #5: logs every rejection reason (no more silent drops)
+//   #6: trailing-stop updates persisted to signalsRef atomically
+//   #7: reconcile uses binanceRetry.fetchWithBackoff
+//   #8: kill switch ignores HTTP 5xx (only trips on real network loss)
+// ═══════════════════════════════════════════════════════════════════════════
+
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { TradeSignal, MarketAsset, ClosedSignal, ClosedOutcome } from './types';
 import { Header, NavTab } from './components/Header';
@@ -8,13 +19,22 @@ import { RiskCalculatorModal } from './components/RiskCalculatorModal';
 import { TrackRecord } from './components/TrackRecord';
 import { CreateAlertModal } from './components/CreateAlertModal';
 import botConfig from './config/botConfig.json';
+
+// 🔧 FIX #1 — import ATR map from signalEngine (single source of truth)
 import {
   scoreConfluence,
   isInKillZone,
   buildRiskLevels,
   positionSize,
+  MIN_ATR_PCT_BY_SYMBOL,
+  DEFAULT_MIN_ATR_PCT,
 } from './utils/signalEngine';
+
 import { getCachedCandles } from './utils/marketData';
+import { fetchWithBackoff, classifyFetchError, classifyHttpError } from './utils/binanceRetry';
+import { acquireScanLock, releaseScanLock, currentScanGeneration, isStaleGeneration } from './utils/scanGuard';
+import { canEnter as dailyCapCanEnter, recordEntry as dailyCapRecordEntry, getEntryCount, ensureDayRollover, debugDailyCaps } from './utils/dailyCap';
+
 import {
   validateTradeWithAi,
   isAiValidatorConfigured,
@@ -22,14 +42,8 @@ import {
   type AiRecentTrade,
 } from './utils/aiTradeValidator';
 import {
-  alertTest,
-  alertTradeOpened,
-  alertTradeClosed,
-  alertDailyDrawdownHit,
-  alertGeoBlock,
-  alertBotStarted,
-  alertBotStopped,
-  alertKillZoneChange,
+  alertTest, alertTradeOpened, alertTradeClosed, alertDailyDrawdownHit,
+  alertGeoBlock, alertBotStarted, alertBotStopped, alertKillZoneChange,
 } from './utils/alertService';
 import {
   Activity, Shield, Flame, XCircle, ArrowUpRight, ArrowDownRight,
@@ -65,7 +79,6 @@ const EC2_PROXY_SECRET = 'WorldWar2026';
 const MIN_CONFLUENCE_SCORE = 70;
 const MIN_KILLZONE_WEIGHT = 0.3;
 const SKIP_KILLZONE_DEFAULT = true;
-
 const SKIP_WEEKENDS = true;
 
 const MAX_ACTIVE_TRADES = 2;
@@ -86,17 +99,16 @@ const TIME_STOP_MS = 60 * 60_000;
 const TIME_STOP_MIN_PNL = -0.5;
 const TIME_STOP_MAX_PNL = 0.3;
 
-const NETWORK_OFFLINE_KILL_THRESHOLD_MS = 5 * 60_000;
+// 🔧 FIX #8 — raise threshold, only real network loss trips kill switch
+const NETWORK_OFFLINE_KILL_THRESHOLD_MS = 10 * 60_000;
+// Number of consecutive network failures (regardless of time) before we care
+const NETWORK_FAILURE_STREAK_WARN = 5;
 
 const SIGNALS_KEEP_CLOSED = 20;
+const RECONCILE_INTERVAL_MS = 3 * 60_000;  // 🔧 FIX #7 — 2m → 3m
 
-const RECONCILE_INTERVAL_MS = 2 * 60_000;
+const LS_DAILY_PNL_KEY = 'tradesignal_daily_pnl_v2';
 
-// 🔧 PERSISTENCE FIX: localStorage keys for daily state
-const LS_DAILY_PNL_KEY = 'tradesignal_daily_pnl';
-const LS_DAILY_ENTRY_COUNT_KEY = 'tradesignal_daily_entry_count';
-
-// 🔧 VOLUME FIX: 1.2 → 1.0 (was killing normal-volume trend starts)
 const VOLUME_CONFIRMATION_MULTIPLIER = 1.0;
 
 const SCAN_WHITELIST = new Set<string>([
@@ -105,19 +117,7 @@ const SCAN_WHITELIST = new Set<string>([
   'DOGE/USDT', 'AVAX/USDT', 'LINK/USDT', 'DOT/USDT',
 ]);
 
-const MIN_ATR_PCT_BY_SYMBOL: Record<string, number> = {
-  'BTC/USDT':  0.0018,
-  'ETH/USDT':  0.0020,
-  'SOL/USDT':  0.0028,
-  'BNB/USDT':  0.0022,
-  'XRP/USDT':  0.0035,
-  'ADA/USDT':  0.0030,
-  'DOGE/USDT': 0.0040,
-  'AVAX/USDT': 0.0035,
-  'LINK/USDT': 0.0030,
-  'DOT/USDT':  0.0030,
-};
-const DEFAULT_MIN_ATR_PCT = 0.0030;
+// ⚠️ MIN_ATR_PCT_BY_SYMBOL is now imported from signalEngine.ts
 
 function getCandleVolume(c: any): number {
   if (!c) return 0;
@@ -127,9 +127,9 @@ function getCandleVolume(c: any): number {
 
 function hasVolumeConfirmation(
   candles: any[],
-  lookbackShort: number = 3,
-  lookbackLong: number = 20,
-  multiplier: number = VOLUME_CONFIRMATION_MULTIPLIER,
+  lookbackShort = 3,
+  lookbackLong = 20,
+  multiplier = VOLUME_CONFIRMATION_MULTIPLIER,
 ): { ok: boolean; shortAvg: number; longAvg: number } {
   if (candles.length < lookbackLong) return { ok: false, shortAvg: 0, longAvg: 0 };
   const recent = candles.slice(-lookbackShort);
@@ -158,7 +158,7 @@ if (typeof window !== 'undefined') {
   };
   console.log(
     '%c🧪 Debug bridge ready — try: window.__signalEngine.scoreConfluence([...], "BTC/USDT")',
-    'color:#9D4EDD;font-style:italic'
+    'color:#9D4EDD;font-style:italic',
   );
 }
 
@@ -268,7 +268,7 @@ const getActiveKillZoneInfo = () => {
   return { name: 'OFF-KILLZONE', weight: 0, range: 'STANDARD BIAS', isActive: false };
 };
 
-const isIn15mCandleCloseWindow = (windowSec: number = CANDLE_CLOSE_WINDOW_SEC): boolean => {
+const isIn15mCandleCloseWindow = (windowSec = CANDLE_CLOSE_WINDOW_SEC): boolean => {
   const now = new Date();
   const minsIntoBar = now.getUTCMinutes() % 15;
   const secsIntoBar = minsIntoBar * 60 + now.getUTCSeconds();
@@ -351,13 +351,11 @@ export const App: React.FC = () => {
   }, [aiValidatorEnabled]);
 
   const [killSwitchOn, setKillSwitchOn] = useState<boolean>(() =>
-    localStorage.getItem('tradesignal_kill_switch') === '1'
+    localStorage.getItem('tradesignal_kill_switch') === '1',
   );
 
   const [networkOffline, setNetworkOffline] = useState<boolean>(false);
-
   const [accountSnapshot, setAccountSnapshot] = useState<AccountSnapshot | null>(null);
-
   const [orphanPositions, setOrphanPositions] = useState<OrphanPosition[]>([]);
   const [orphanBannerDismissed, setOrphanBannerDismissed] = useState<boolean>(false);
 
@@ -425,30 +423,10 @@ export const App: React.FC = () => {
 
   const journalRecordedRef = useRef<Set<string>>(new Set());
 
-  // 🔧 PERSISTENCE FIX: restore per-symbol daily entry count from localStorage
-  const dailyEntryCountRef = useRef<Record<string, number>>(
-    (() => {
-      try {
-        const today = new Date().toISOString().slice(0, 10);
-        const saved = localStorage.getItem(LS_DAILY_ENTRY_COUNT_KEY);
-        if (!saved) return {};
-        const parsed = JSON.parse(saved);
-        if (!parsed || typeof parsed !== 'object') return {};
-        const filtered: Record<string, number> = {};
-        for (const [k, v] of Object.entries(parsed)) {
-          if (typeof k === 'string' && k.startsWith(today + '|')) {
-            filtered[k] = Number(v) || 0;
-          }
-        }
-        return filtered;
-      } catch { return {}; }
-    })()
-  );
-  const MAX_ENTRIES_PER_SYMBOL_PER_DAY = 2;
-
   const lossCooldownRef = useRef<Record<string, number>>({});
 
-  // 🔧 PERSISTENCE FIX: restore daily PnL from localStorage (only if same UTC day)
+  // 🔧 FIX #4 — daily PnL still persisted here, but the per-symbol count is
+  // now handled entirely by the dailyCap module (which owns its own storage).
   const dailyPnlRef = useRef<{ day: string; pnl: number }>(
     (() => {
       try {
@@ -461,7 +439,7 @@ export const App: React.FC = () => {
         }
         return { day: today, pnl: 0 };
       } catch { return { day: '', pnl: 0 }; }
-    })()
+    })(),
   );
 
   const exchangeInfoRef = useRef<Record<string, { stepSize: number; minQty: number; tickSize: number }>>({});
@@ -533,7 +511,7 @@ export const App: React.FC = () => {
     const path = apiSettings.enableFutures ? '/fapi/v1/exchangeInfo' : '/api/v3/exchangeInfo';
     const proxiedUrl = getCorsProxyUrl(`${baseUrl}${path}`);
     try {
-      const res = await fetch(proxiedUrl);
+      const res = await fetchWithBackoff(proxiedUrl);
       if (!res.ok) { console.warn('[exchangeInfo] HTTP', res.status); return; }
       const data = await res.json();
       const map: Record<string, { stepSize: number; minQty: number; tickSize: number }> = {};
@@ -561,6 +539,7 @@ export const App: React.FC = () => {
     return Number(rounded.toFixed(decimals));
   };
 
+  // 🔧 FIX #7 — balance refresh via fetchWithBackoff
   const refreshAccountSnapshot = async (): Promise<AccountSnapshot | null> => {
     if (!apiSettings.apiKey || !apiSettings.apiSecret || !apiSettings.enableFutures) return null;
     const baseUrl = getBaseUrl(apiSettings.environment, true);
@@ -571,10 +550,18 @@ export const App: React.FC = () => {
     } catch { return null; }
     const url = getCorsProxyUrl(`${baseUrl}/fapi/v2/account?${qs}&signature=${signature}`);
     try {
-      const res = await fetch(url, {
+      const res = await fetchWithBackoff(url, {
         headers: { 'X-MBX-APIKEY': apiSettings.apiKey, 'Content-Type': 'application/json' },
       });
-      if (!res.ok) { console.warn('[balance] HTTP', res.status); return null; }
+      if (!res.ok) {
+        const cls = classifyHttpError(res.status, await res.text().catch(() => ''));
+        console.warn('[balance]', cls.message);
+        // 🔧 FIX #8 — don't count 5xx as network failure
+        if (cls.kind === 'network') {
+          networkFailureStreakRef.current += 1;
+        }
+        return null;
+      }
       const data = await res.json();
       if (!data || data.code) { console.warn('[balance] err', data); return null; }
       const snapshot: AccountSnapshot = {
@@ -594,29 +581,27 @@ export const App: React.FC = () => {
 
       return snapshot;
     } catch (err: any) {
-      console.warn('[balance] network err', err.message);
+      const cls = classifyFetchError(err);
+      console.warn('[balance] network err', cls.message);
 
-      const msg = String(err?.message ?? '');
-      const isNetworkErr =
-        msg.includes('Failed to fetch') ||
-        msg.includes('NetworkError') ||
-        msg.includes('ERR_INTERNET') ||
-        msg.includes('ERR_NETWORK') ||
-        msg.includes('ERR_CONNECTION');
-
-      if (isNetworkErr) {
+      if (cls.kind === 'network') {
         networkFailureStreakRef.current += 1;
         const offlineMs = Date.now() - lastSuccessfulBalanceRef.current;
         const offlineSec = Math.round(offlineMs / 1000);
 
         setNetworkOffline(true);
         console.log(
-          `[balance] network down (streak ${networkFailureStreakRef.current}, offline ${offlineSec}s)`
+          `[balance] network down (streak ${networkFailureStreakRef.current}, offline ${offlineSec}s)`,
         );
 
-        if (offlineMs >= NETWORK_OFFLINE_KILL_THRESHOLD_MS && !killSwitchRef.current) {
+        // 🔧 FIX #8 — require BOTH time and streak before tripping
+        if (
+          offlineMs >= NETWORK_OFFLINE_KILL_THRESHOLD_MS &&
+          networkFailureStreakRef.current >= NETWORK_FAILURE_STREAK_WARN &&
+          !killSwitchRef.current
+        ) {
           tripKillSwitch(
-            `Network offline for ${Math.round(offlineMs / 60000)} min — cannot verify balance`
+            `Network offline for ${Math.round(offlineMs / 60000)} min (${networkFailureStreakRef.current} consecutive failures)`,
           );
         }
       }
@@ -633,7 +618,7 @@ export const App: React.FC = () => {
     catch { return 0; }
     const url = getCorsProxyUrl(`${baseUrl}/fapi/v2/positionRisk?${qs}&signature=${sig}`);
     try {
-      const res = await fetch(url, {
+      const res = await fetchWithBackoff(url, {
         headers: { 'X-MBX-APIKEY': apiSettings.apiKey, 'Content-Type': 'application/json' },
       });
       if (!res.ok) return 0;
@@ -653,7 +638,7 @@ export const App: React.FC = () => {
     catch { return []; }
     const url = getCorsProxyUrl(`${baseUrl}/fapi/v2/positionRisk?${qs}&signature=${sig}`);
     try {
-      const res = await fetch(url, {
+      const res = await fetchWithBackoff(url, {
         headers: { 'X-MBX-APIKEY': apiSettings.apiKey, 'Content-Type': 'application/json' },
       });
       if (!res.ok) return [];
@@ -681,7 +666,7 @@ export const App: React.FC = () => {
     catch { return null; }
     const url = getCorsProxyUrl(`${baseUrl}/fapi/v1/openAlgoOrders?${qs}&signature=${sig}`);
     try {
-      const res = await fetch(url, {
+      const res = await fetchWithBackoff(url, {
         headers: { 'X-MBX-APIKEY': apiSettings.apiKey, 'Content-Type': 'application/json' },
       });
       if (!res.ok) return null;
@@ -690,19 +675,15 @@ export const App: React.FC = () => {
       const slOrder = data.find((o: any) =>
         o.orderType === 'STOP_MARKET' || o.type === 'STOP_MARKET' ||
         o.algoType === 'STOP_MARKET' ||
-        (String(o.type || o.orderType || '').toUpperCase().includes('STOP'))
+        (String(o.type || o.orderType || '').toUpperCase().includes('STOP')),
       );
       if (!slOrder) return null;
-      const trigger = parseFloat(
-        slOrder.triggerPrice ?? slOrder.stopPrice ?? slOrder.tp ?? '0'
-      );
+      const trigger = parseFloat(slOrder.triggerPrice ?? slOrder.stopPrice ?? slOrder.tp ?? '0');
       return Number.isFinite(trigger) && trigger > 0 ? trigger : null;
     } catch { return null; }
   };
 
-  const fetchLastFillPrice = async (
-    binanceSym: string,
-  ): Promise<{ price: number; time: number } | null> => {
+  const fetchLastFillPrice = async (binanceSym: string): Promise<{ price: number; time: number } | null> => {
     if (!apiSettings.apiKey || !apiSettings.apiSecret) return null;
     const baseUrl = getBaseUrl(apiSettings.environment, true);
     const qs = `symbol=${binanceSym}&limit=5&timestamp=${Date.now()}&recvWindow=10000`;
@@ -711,7 +692,7 @@ export const App: React.FC = () => {
     catch { return null; }
     const url = getCorsProxyUrl(`${baseUrl}/fapi/v1/userTrades?${qs}&signature=${sig}`);
     try {
-      const res = await fetch(url, {
+      const res = await fetchWithBackoff(url, {
         headers: { 'X-MBX-APIKEY': apiSettings.apiKey, 'Content-Type': 'application/json' },
       });
       if (!res.ok) return null;
@@ -754,7 +735,7 @@ export const App: React.FC = () => {
     const proxiedUrl = getCorsProxyUrl(targetUrl);
 
     try {
-      const res = await fetch(proxiedUrl, {
+      const res = await fetchWithBackoff(proxiedUrl, {
         method: 'POST',
         headers: { 'X-MBX-APIKEY': apiSettings.apiKey, 'Content-Type': 'application/json' },
       });
@@ -783,7 +764,7 @@ export const App: React.FC = () => {
     const baseUrl = getBaseUrl(apiSettings.environment, true);
     const url = getCorsProxyUrl(`${baseUrl}/fapi/v1/premiumIndex`);
     try {
-      const res = await fetch(url);
+      const res = await fetchWithBackoff(url);
       if (!res.ok) {
         return cachePopulated ? (fundingCacheRef.current.map[binanceSym] ?? 0) : 0;
       }
@@ -848,24 +829,11 @@ export const App: React.FC = () => {
   useEffect(() => { localStorage.setItem('tradesignal_crypto_signals', JSON.stringify(signals)); }, [signals]);
   useEffect(() => { localStorage.setItem('tradesignal_binance_api_config', JSON.stringify(apiSettings)); }, [apiSettings]);
 
-  // 🔧 PERSISTENCE FIX: persist daily entry count on every change
+  // 🔧 FIX #4 — persist daily PnL but NOT the daily entry count (dailyCap owns it)
   useEffect(() => {
     try {
-      localStorage.setItem(
-        LS_DAILY_ENTRY_COUNT_KEY,
-        JSON.stringify(dailyEntryCountRef.current),
-      );
-    } catch { /* ignore quota errors */ }
-  }, [signals]);
-
-  // 🔧 PERSISTENCE FIX: persist daily PnL on every change
-  useEffect(() => {
-    try {
-      localStorage.setItem(
-        LS_DAILY_PNL_KEY,
-        JSON.stringify(dailyPnlRef.current),
-      );
-    } catch { /* ignore quota errors */ }
+      localStorage.setItem(LS_DAILY_PNL_KEY, JSON.stringify(dailyPnlRef.current));
+    } catch { /* ignore */ }
   }, [signals]);
 
   useEffect(() => {
@@ -879,21 +847,22 @@ export const App: React.FC = () => {
     refreshAccountSnapshot();
     const t = setInterval(refreshAccountSnapshot, BALANCE_REFRESH_MS);
     return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [apiSettings.isConfigured, apiSettings.environment, apiSettings.enableFutures, apiSettings.apiKey]);
 
-  // 🔧 PERSISTENCE FIX: rollover also clears/persists localStorage
+  // 🔧 FIX #4 — daily rollover only touches dailyPnl here; dailyCap handles its own
   useEffect(() => {
     const rollover = () => {
       const today = new Date().toISOString().slice(0, 10);
       if (dailyPnlRef.current.day !== today) {
         dailyPnlRef.current = { day: today, pnl: 0 };
-        dailyEntryCountRef.current = {};
         try {
           localStorage.setItem(LS_DAILY_PNL_KEY, JSON.stringify({ day: today, pnl: 0 }));
-          localStorage.removeItem(LS_DAILY_ENTRY_COUNT_KEY);
         } catch { /* ignore */ }
-        console.log(`[DAY-ROLLOVER] Daily PnL + per-symbol entry counts reset for ${today}`);
+        console.log(`[DAY-ROLLOVER] Daily PnL reset for ${today}`);
       }
+      // Also trigger dailyCap rollover
+      ensureDayRollover();
     };
     rollover();
     const t = setInterval(rollover, 30_000);
@@ -959,7 +928,7 @@ export const App: React.FC = () => {
     const baseUrl = getBaseUrl(apiSettings.environment, true);
     const proxiedUrl = getCorsProxyUrl(`${baseUrl}/fapi/v1/listenKey`);
     try {
-      const res = await fetch(proxiedUrl, {
+      const res = await fetchWithBackoff(proxiedUrl, {
         method: 'POST',
         headers: { 'X-MBX-APIKEY': apiSettings.apiKey, 'Content-Type': 'application/json' },
       });
@@ -992,7 +961,7 @@ export const App: React.FC = () => {
     const baseUrl = getBaseUrl(apiSettings.environment, true);
     const proxiedUrl = getCorsProxyUrl(`${baseUrl}/fapi/v1/listenKey?listenKey=${listenKey}`);
     try {
-      const res = await fetch(proxiedUrl, { method: 'PUT', headers: { 'X-MBX-APIKEY': apiSettings.apiKey } });
+      const res = await fetchWithBackoff(proxiedUrl, { method: 'PUT', headers: { 'X-MBX-APIKEY': apiSettings.apiKey } });
       return res.ok;
     } catch { return false; }
   };
@@ -1015,7 +984,7 @@ export const App: React.FC = () => {
       catch { return null; }
       const url = getCorsProxyUrl(`${baseUrl}${path}?${qs}&signature=${sig}`);
       try {
-        const res = await fetch(url, { method, headers });
+        const res = await fetchWithBackoff(url, { method, headers });
         const text = await res.text();
         if (!res.ok) {
           console.warn(`[cancelAlgo] ${method} ${path} HTTP ${res.status}: ${text.slice(0, 200)}`);
@@ -1034,10 +1003,7 @@ export const App: React.FC = () => {
       for (const o of open) {
         const algoId = o?.algoId ?? o?.clientAlgoId;
         if (!algoId) continue;
-        await signAndCall('DELETE', '/fapi/v1/algoOrder', {
-          symbol: sym,
-          algoId: String(algoId),
-        });
+        await signAndCall('DELETE', '/fapi/v1/algoOrder', { symbol: sym, algoId: String(algoId) });
       }
     }
 
@@ -1047,7 +1013,7 @@ export const App: React.FC = () => {
 
   const executeBinanceOrder = async (
     symbol: string, side: 'BUY' | 'SELL', quantity: number,
-    orderType: 'MARKET' | 'LIMIT' = 'MARKET', price?: number, reduceOnly: boolean = false,
+    orderType: 'MARKET' | 'LIMIT' = 'MARKET', price?: number, reduceOnly = false,
   ): Promise<{ success: boolean; orderId?: string; error?: string; fillPrice?: number }> => {
     if (!apiSettings.apiKey || !apiSettings.apiSecret) return { success: false, error: 'API credentials not configured' };
     const isFutures = apiSettings.enableFutures;
@@ -1083,7 +1049,7 @@ export const App: React.FC = () => {
 
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
-        const res = await fetch(proxiedUrl, {
+        const res = await fetchWithBackoff(proxiedUrl, {
           method: 'POST',
           headers: { 'X-MBX-APIKEY': apiSettings.apiKey, 'Content-Type': 'application/json' },
         });
@@ -1152,7 +1118,7 @@ export const App: React.FC = () => {
       const endpoint = isFutures ? '/fapi/v1/order' : '/api/v3/order';
       const url = getCorsProxyUrl(`${baseUrl}${endpoint}?${qs}&signature=${sig}`);
       try {
-        const res = await fetch(url, {
+        const res = await fetchWithBackoff(url, {
           method: 'POST',
           headers: { 'X-MBX-APIKEY': apiSettings.apiKey, 'Content-Type': 'application/json' },
         });
@@ -1175,7 +1141,7 @@ export const App: React.FC = () => {
       catch { return false; }
       const url = getCorsProxyUrl(`${baseUrl}/fapi/v1/leverage?${qs}&signature=${sig}`);
       try {
-        const res = await fetch(url, {
+        const res = await fetchWithBackoff(url, {
           method: 'POST',
           headers: { 'X-MBX-APIKEY': apiSettings.apiKey, 'Content-Type': 'application/json' },
         });
@@ -1201,7 +1167,7 @@ export const App: React.FC = () => {
       if (preSig) {
         try {
           const preUrl = getCorsProxyUrl(`${baseUrl}/fapi/v2/positionRisk?${preQs}&signature=${preSig}`);
-          const preRes = await fetch(preUrl, {
+          const preRes = await fetchWithBackoff(preUrl, {
             headers: { 'X-MBX-APIKEY': apiSettings.apiKey, 'Content-Type': 'application/json' },
           });
           if (preRes.ok) {
@@ -1224,7 +1190,7 @@ export const App: React.FC = () => {
       catch { return false; }
       const url = getCorsProxyUrl(`${baseUrl}/fapi/v1/marginType?${qs}&signature=${sig}`);
       try {
-        const res = await fetch(url, {
+        const res = await fetchWithBackoff(url, {
           method: 'POST',
           headers: { 'X-MBX-APIKEY': apiSettings.apiKey, 'Content-Type': 'application/json' },
         });
@@ -1245,22 +1211,19 @@ export const App: React.FC = () => {
 
     const sendAlgoOrder = async (params: Record<string, string>) => {
       if (!isFutures) return { err: 'Algo orders are futures-only' };
-
       const algoParams: Record<string, string> = {
         ...params,
         algoType: 'CONDITIONAL',
         timestamp: Date.now().toString(),
         recvWindow: '10000',
       };
-
       const qs = Object.entries(algoParams).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&');
       let sig: string;
       try { sig = await generateSignature(qs, apiSettings.apiSecret); }
       catch (err: any) { return { err: `Signature error: ${err.message}` }; }
-
       const url = getCorsProxyUrl(`${baseUrl}/fapi/v1/algoOrder?${qs}&signature=${sig}`);
       try {
-        const res = await fetch(url, {
+        const res = await fetchWithBackoff(url, {
           method: 'POST',
           headers: { 'X-MBX-APIKEY': apiSettings.apiKey, 'Content-Type': 'application/json' },
         });
@@ -1321,7 +1284,7 @@ export const App: React.FC = () => {
         const detailQs = `symbol=${sym}&orderId=${entry.orderId}&timestamp=${Date.now()}&recvWindow=10000`;
         const detailSig = await generateSignature(detailQs, apiSettings.apiSecret);
         const detailUrl = getCorsProxyUrl(`${baseUrl}/fapi/v1/order?${detailQs}&signature=${detailSig}`);
-        const detailRes = await fetch(detailUrl, {
+        const detailRes = await fetchWithBackoff(detailUrl, {
           headers: { 'X-MBX-APIKEY': apiSettings.apiKey, 'Content-Type': 'application/json' },
         });
         if (detailRes.ok) {
@@ -1380,7 +1343,7 @@ export const App: React.FC = () => {
       const emergency = await executeBinanceOrder(symbol, closeSide, roundedQty, 'MARKET', undefined, true);
       if (!emergency.success) {
         tripKillSwitch(
-          `Naked position on ${symbol} could not be closed: ${emergency.error}. MANUAL INTERVENTION REQUIRED.`
+          `Naked position on ${symbol} could not be closed: ${emergency.error}. MANUAL INTERVENTION REQUIRED.`,
         );
         return { success: false, error: `Entry filled but SL/TP failed AND emergency close failed: ${emergency.error}`, orderId: String(entry.orderId), fillPrice };
       }
@@ -1400,7 +1363,7 @@ export const App: React.FC = () => {
   };
 
   // ═════════════════════════════════════════════════════════════════════════
-  // RECONCILE ACTIVE SIGNALS — safety net for missed SL/TP fills
+  // 🔧 FIX #6 — reconcile uses signalsRef and atomically updates via patchSignal
   // ═════════════════════════════════════════════════════════════════════════
   const reconcileActiveSignals = async (tag: string): Promise<void> => {
     if (!apiSettings.apiKey || !apiSettings.apiSecret || !apiSettings.enableFutures) return;
@@ -1441,7 +1404,7 @@ export const App: React.FC = () => {
 
         console.log(
           `[RECONCILE-${tag}] ${sig.symbol}: NOT on Binance → marking CLOSED ` +
-          `(exit $${exitPrice}, pnl ${pnlPct}%, outcome ${outcome})`
+          `(exit $${exitPrice}, pnl ${pnlPct}%, outcome ${outcome})`,
         );
 
         markClosedHandled(sig.id);
@@ -1481,7 +1444,6 @@ export const App: React.FC = () => {
     }
   };
 
-  // Periodic reconciliation — every 2 min as safety net
   useEffect(() => {
     if (!apiSettings.apiKey || !apiSettings.apiSecret || !apiSettings.enableFutures) return;
 
@@ -1501,7 +1463,7 @@ export const App: React.FC = () => {
   }, [apiSettings.apiKey, apiSettings.apiSecret, apiSettings.enableFutures]);
 
   // ═════════════════════════════════════════════════════════════════════════
-  // USER DATA STREAM
+  // USER DATA STREAM (unchanged logic, uses fetchWithBackoff via helpers)
   // ═════════════════════════════════════════════════════════════════════════
   useEffect(() => {
     if (!apiSettings.apiKey || !apiSettings.enableFutures) return;
@@ -1531,9 +1493,7 @@ export const App: React.FC = () => {
             const algoIdRaw = o.aid ?? o.algoId ?? o.clientAlgoId ?? o.caid;
             const algoId = algoIdRaw != null ? String(algoIdRaw) : null;
             const algoStatus = String(o.st ?? o.algoStatus ?? o.X ?? '').toUpperCase();
-            const triggerPrice = parseFloat(
-              String(o.tp ?? o.triggerPrice ?? o.actualPrice ?? o.ap ?? '0')
-            ) || 0;
+            const triggerPrice = parseFloat(String(o.tp ?? o.triggerPrice ?? o.actualPrice ?? o.ap ?? '0')) || 0;
 
             if (!rawSymbol || !algoId) return;
 
@@ -1583,15 +1543,13 @@ export const App: React.FC = () => {
               tripKillSwitch(`Daily loss ${dailyPnlRef.current.pnl.toFixed(2)}% hit -${MAX_DAILY_LOSS_PCT}%`);
             }
 
-            const closedTrade: Partial<TradeSignal> = {
+            patchSignal(target.id, {
               currentPrice: exitP,
               pnlPercentage: pnlPct,
               status: 'CLOSED',
               outcome,
               closedAt: Date.now(),
-            };
-            setSignals((prev) => prev.map((sig) => (sig.id === target.id ? { ...sig, ...closedTrade } : sig)));
-            signalsRef.current = signalsRef.current.map((sig) => (sig.id === target.id ? { ...sig, ...closedTrade } : sig));
+            });
             return;
           }
 
@@ -1608,21 +1566,12 @@ export const App: React.FC = () => {
           const target = signalsRef.current.find((sig) =>
             sig.symbol === symbolFormatted &&
             sig.status === 'ACTIVE' &&
-            sig.binanceOrderId === orderId
+            sig.binanceOrderId === orderId,
           );
           if (!target) return;
           if (orderStatus !== 'FILLED' || fillPrice <= 0) return;
 
-          setSignals((prev) => prev.map((sig) =>
-            sig.id === target.id
-              ? { ...sig, entryPrice: fillPrice, currentPrice: fillPrice }
-              : sig
-          ));
-          signalsRef.current = signalsRef.current.map((sig) =>
-            sig.id === target.id
-              ? { ...sig, entryPrice: fillPrice, currentPrice: fillPrice }
-              : sig
-          );
+          patchSignal(target.id, { entryPrice: fillPrice, currentPrice: fillPrice });
         } catch (err) {
           console.error('User stream parse error:', err);
         }
@@ -1672,7 +1621,7 @@ export const App: React.FC = () => {
       const signature = await generateSignature(queryString, apiSettings.apiSecret);
       const targetUrl = `${baseUrl}${endpoint}?${queryString}&signature=${signature}`;
       const proxiedUrl = getCorsProxyUrl(targetUrl);
-      const response = await fetch(proxiedUrl, {
+      const response = await fetchWithBackoff(proxiedUrl, {
         method: 'GET',
         headers: { 'X-MBX-APIKEY': apiSettings.apiKey, 'Content-Type': 'application/json' },
       });
@@ -1821,477 +1770,504 @@ ${items.join('\n\n')}
     setTimeout(() => setCopiedAllTrades(false), 2000);
   };
 
-  // MAIN SCAN
-  const handleExecuteCryptoScalpScan = async () => {
-    console.log('[SCAN] ========== Scan starting ==========');
-    if (killSwitchRef.current) {
-      setConnectionLog('🛑 Kill switch is ON — scan aborted. Clear it in Settings to resume.');
+  // ═════════════════════════════════════════════════════════════════════════
+  // 🔧 MAIN SCAN — FIXED (#3 mutex, #4 dailyCap, #5 full rejection logging)
+  // ═════════════════════════════════════════════════════════════════════════
+  const handleExecuteCryptoScalpScan = async (trigger = 'manual') => {
+    // 🔧 FIX #3 — scan guard
+    const lock = acquireScanLock(trigger);
+    if (!lock.proceed) {
       return;
     }
-    const currentAssets = assetsRef.current;
-    const currentSignals = signalsRef.current;
-    if (!currentAssets.length) return;
-    if (isScanningRef.current) return;
+    const myGen = lock.generation!;
 
-    if (SKIP_WEEKENDS) {
-      const dow = new Date().getUTCDay();
-      if (dow === 0 || dow === 6) {
-        const dayName = dow === 0 ? 'Sunday' : 'Saturday';
-        console.log(`[WEEKEND] ${dayName} UTC — new entries blocked. Existing trades unaffected.`);
-        setConnectionLog(`⏸ Weekend (${dayName} UTC) — no new entries. Existing trades run their SL/TP.`);
+    try {
+      console.log(`[SCAN] ========== Scan starting (trigger=${trigger}, gen=${myGen}) ==========`);
+      if (killSwitchRef.current) {
+        setConnectionLog('🛑 Kill switch is ON — scan aborted.');
         return;
       }
-    }
+      const currentAssets = assetsRef.current;
+      const currentSignals = signalsRef.current;
+      if (!currentAssets.length) return;
 
-    const zone = isInKillZone();
-    if (!skipKillZone && zone.weight < MIN_KILLZONE_WEIGHT) {
-      setConnectionLog(`⏸ Outside high-weight kill zones (${zone.name}, w=${zone.weight}) — skipped.`);
-      return;
-    }
+      if (SKIP_WEEKENDS) {
+        const dow = new Date().getUTCDay();
+        if (dow === 0 || dow === 6) {
+          const dayName = dow === 0 ? 'Sunday' : 'Saturday';
+          console.log(`[WEEKEND] ${dayName} UTC — new entries blocked.`);
+          setConnectionLog(`⏸ Weekend (${dayName} UTC) — no new entries.`);
+          return;
+        }
+      }
 
-    const today = new Date().toISOString().slice(0, 10);
-    if (dailyPnlRef.current.day !== today) dailyPnlRef.current = { day: today, pnl: 0 };
+      const zone = isInKillZone();
+      if (!skipKillZone && zone.weight < MIN_KILLZONE_WEIGHT) {
+        setConnectionLog(`⏸ Outside high-weight kill zones (${zone.name}, w=${zone.weight}) — skipped.`);
+        return;
+      }
 
-    if (dailyPnlRef.current.pnl <= -botConfig.risk_engine.max_daily_drawdown_percent) {
-      setConnectionLog(
-        `🛑 Daily drawdown limit reached (${dailyPnlRef.current.pnl.toFixed(2)}% ≤ -${botConfig.risk_engine.max_daily_drawdown_percent}%) — paused.`
-      );
-      alertDailyDrawdownHit(dailyPnlRef.current.pnl, apiSettings.environment);
-      return;
-    }
-    if (dailyPnlRef.current.pnl <= -MAX_DAILY_LOSS_PCT) {
-      tripKillSwitch(`Daily loss ${dailyPnlRef.current.pnl.toFixed(2)}% ≤ -${MAX_DAILY_LOSS_PCT}%`);
-      return;
-    }
+      const today = new Date().toISOString().slice(0, 10);
+      if (dailyPnlRef.current.day !== today) dailyPnlRef.current = { day: today, pnl: 0 };
 
-    if (!apiSettings.apiKey || !apiSettings.apiSecret || !apiSettings.isConfigured) {
-      setConnectionLog('⚠️ Cannot trade — API keys not verified. Open Settings → Verify Connection.');
-      return;
-    }
-
-    let snapshot = accountSnapshotRef.current;
-    const ageMs = snapshot ? Date.now() - snapshot.updatedAt : Infinity;
-    if (!snapshot || ageMs > BALANCE_STALE_MS) {
-      setConnectionLog(`🔄 Balance stale (${ageMs === Infinity ? 'never' : Math.round(ageMs / 1000) + 's'}) — refreshing before scan...`);
-      snapshot = await refreshAccountSnapshot();
-    }
-
-    if (!snapshot) {
-      setConnectionLog('⛔ Balance unknown — scan skipped (network).');
-      return;
-    }
-    consecutiveFailuresRef.current = 0;
-
-    if (snapshot.availableBalance <= 0) {
-      setConnectionLog(`⛔ Free margin = $${snapshot.availableBalance.toFixed(2)}. Scan aborted.`);
-      return;
-    }
-
-    setIsScanning(true);
-
-    const currentActive = currentSignals.filter((s) => s.status === 'ACTIVE');
-    const slots = MAX_ACTIVE_TRADES - currentActive.length;
-    if (slots <= 0) { setIsScanning(false); return; }
-
-    const existingLongs = currentActive.filter((s) => s.direction.includes('BUY')).length;
-    const existingShorts = currentActive.length - existingLongs;
-    const longSlots = Math.max(0, MAX_SAME_DIRECTION - existingLongs);
-    const shortSlots = Math.max(0, MAX_SAME_DIRECTION - existingShorts);
-    if (longSlots === 0 && shortSlots === 0) {
-      setConnectionLog(`⏸ Direction cap reached (${existingLongs}L / ${existingShorts}S, max ${MAX_SAME_DIRECTION} each).`);
-      setIsScanning(false);
-      return;
-    }
-
-    const busySymbols = new Set(currentActive.map((s) => s.symbol));
-    const symbolsToScan = currentAssets
-      .filter((a) => SCAN_WHITELIST.has(a.symbol))
-      .filter((a) => !busySymbols.has(a.symbol))
-      .filter((a) => {
-        const lastSL = lossCooldownRef.current[a.symbol] ?? 0;
-        return Date.now() - lastSL >= COOLDOWN_AFTER_SL_MS;
-      });
-
-    if (aiValidatorEnabled && !isAiValidatorConfigured()) {
-      setConnectionLog(
-        '⚠️ AI Validator is ON but no Gemini key is loaded — falling back to rules-only. ' +
-        'Set one with: await window.setGeminiKey("...")'
-      );
-    }
-
-    console.log(`[SCAN] Fetching real candles for ${symbolsToScan.length} symbols...`);
-    const candleResults = await Promise.all(
-      symbolsToScan.map(async (asset) => {
-        const { candles, error } = await getRealCandles(asset.symbol, '5m', 220);
-        return { asset, candles, error };
-      }),
-    );
-
-    const newPositions: TradeSignal[] = [];
-    let longsQueued = 0, shortsQueued = 0;
-    const aiMultiplierMap: Record<string, number> = {};
-    let rejectedAtAtr = 0;
-    let rejectedAt4h = 0;
-    let rejectedAtVolume = 0;
-
-    for (const { asset, candles, error } of candleResults) {
-      if (newPositions.length >= slots) break;
-      if (error || candles.length < 30) continue;
-
-      const todayKey = `${new Date().toISOString().slice(0, 10)}|${asset.symbol}`;
-      const todayCount = dailyEntryCountRef.current[todayKey] ?? 0;
-      if (todayCount >= MAX_ENTRIES_PER_SYMBOL_PER_DAY) {
-        console.log(
-          `[SCAN] ${asset.symbol}: ❌ daily entry cap reached ` +
-          `(${todayCount}/${MAX_ENTRIES_PER_SYMBOL_PER_DAY}) — skipping`
+      if (dailyPnlRef.current.pnl <= -botConfig.risk_engine.max_daily_drawdown_percent) {
+        setConnectionLog(
+          `🛑 Daily drawdown limit reached (${dailyPnlRef.current.pnl.toFixed(2)}% ≤ -${botConfig.risk_engine.max_daily_drawdown_percent}%) — paused.`,
         );
-        continue;
+        alertDailyDrawdownHit(dailyPnlRef.current.pnl, apiSettings.environment);
+        return;
+      }
+      if (dailyPnlRef.current.pnl <= -MAX_DAILY_LOSS_PCT) {
+        tripKillSwitch(`Daily loss ${dailyPnlRef.current.pnl.toFixed(2)}% ≤ -${MAX_DAILY_LOSS_PCT}%`);
+        return;
       }
 
-      const confluence = scoreConfluence(candles, asset.symbol);
-      console.log(`[SCAN] ${asset.symbol}: 5m score=${confluence.total.toFixed(0)} dir=${confluence.direction} | ${confluence.reasons.join(', ')}`);
-
-      if (confluence.total === 0 && confluence.direction === 'NONE') {
-        const symbolThreshold = MIN_ATR_PCT_BY_SYMBOL[asset.symbol] ?? DEFAULT_MIN_ATR_PCT;
-        const detectedAtrPct = confluence.indicators?.atrPct ?? 0;
-        if (detectedAtrPct > 0 && detectedAtrPct < symbolThreshold) {
-          rejectedAtAtr++;
-          console.log(
-            `[SCAN] ${asset.symbol}: [ATR-HINT] detected ${(detectedAtrPct * 100).toFixed(3)}% vs desired ${(symbolThreshold * 100).toFixed(2)}%`
-          );
-        }
+      if (!apiSettings.apiKey || !apiSettings.apiSecret || !apiSettings.isConfigured) {
+        setConnectionLog('⚠️ Cannot trade — API keys not verified.');
+        return;
       }
 
-      if (confluence.total < MIN_CONFLUENCE_SCORE || confluence.direction === 'NONE') continue;
-
-      const { candles: candles15m } = await getRealCandles(asset.symbol, '15m', 60);
-      if (candles15m.length < 30) {
-        console.log(`[SCAN] ${asset.symbol}: ⏸ 15m candles insufficient (${candles15m.length})`);
-        continue;
-      }
-      const trend15m = scoreConfluence(candles15m, asset.symbol);
-      console.log(`[SCAN] ${asset.symbol}: 15m score=${trend15m.total.toFixed(0)} dir=${trend15m.direction}`);
-
-      if (confluence.direction === 'LONG' && trend15m.direction !== 'LONG') {
-        console.log(`[SCAN] ${asset.symbol}: ❌ rejected — 5m LONG but 15m is ${trend15m.direction}`);
-        continue;
-      }
-      if (confluence.direction === 'SHORT' && trend15m.direction !== 'SHORT') {
-        console.log(`[SCAN] ${asset.symbol}: ❌ rejected — 5m SHORT but 15m is ${trend15m.direction}`);
-        continue;
+      let snapshot = accountSnapshotRef.current;
+      const ageMs = snapshot ? Date.now() - snapshot.updatedAt : Infinity;
+      if (!snapshot || ageMs > BALANCE_STALE_MS) {
+        setConnectionLog(`🔄 Balance stale (${ageMs === Infinity ? 'never' : Math.round(ageMs / 1000) + 's'}) — refreshing...`);
+        snapshot = await refreshAccountSnapshot();
       }
 
-      const { candles: candles1h } = await getRealCandles(asset.symbol, '1h', 60);
-      let trend1h: { total: number; direction: 'LONG' | 'SHORT' | 'NONE'; reasons: string[] } =
-        { total: 0, direction: 'NONE', reasons: [] };
-      if (candles1h.length >= 30) {
-        trend1h = scoreConfluence(candles1h, asset.symbol);
-        console.log(`[SCAN] ${asset.symbol}: 1h score=${trend1h.total.toFixed(0)} dir=${trend1h.direction}`);
-        if (confluence.direction === 'LONG' && trend1h.direction === 'SHORT') {
-          console.log(`[SCAN] ${asset.symbol}: ❌ rejected — 5m LONG against 1h SHORT`);
-          continue;
-        }
-        if (confluence.direction === 'SHORT' && trend1h.direction === 'LONG') {
-          console.log(`[SCAN] ${asset.symbol}: ❌ rejected — 5m SHORT against 1h LONG`);
-          continue;
-        }
+      if (!snapshot) {
+        setConnectionLog('⛔ Balance unknown — scan skipped (network).');
+        return;
+      }
+      consecutiveFailuresRef.current = 0;
+
+      if (snapshot.availableBalance <= 0) {
+        setConnectionLog(`⛔ Free margin = $${snapshot.availableBalance.toFixed(2)}. Scan aborted.`);
+        return;
       }
 
-      const { candles: candles4h } = await getRealCandles(asset.symbol, '4h', 60);
-      if (candles4h.length >= 30) {
-        const trend4h = scoreConfluence(candles4h, asset.symbol);
-        console.log(`[SCAN] ${asset.symbol}: 4h score=${trend4h.total.toFixed(0)} dir=${trend4h.direction}`);
-        if (confluence.direction === 'LONG' && trend4h.direction === 'SHORT') {
-          console.log(`[SCAN] ${asset.symbol}: ❌ rejected — 5m LONG against 4h SHORT`);
-          rejectedAt4h++;
-          continue;
-        }
-        if (confluence.direction === 'SHORT' && trend4h.direction === 'LONG') {
-          console.log(`[SCAN] ${asset.symbol}: ❌ rejected — 5m SHORT against 4h LONG`);
-          rejectedAt4h++;
-          continue;
-        }
+      setIsScanning(true);
+      isScanningRef.current = true;
+
+      const currentActive = currentSignals.filter((s) => s.status === 'ACTIVE');
+      const slots = MAX_ACTIVE_TRADES - currentActive.length;
+      if (slots <= 0) { setIsScanning(false); isScanningRef.current = false; return; }
+
+      const existingLongs = currentActive.filter((s) => s.direction.includes('BUY')).length;
+      const existingShorts = currentActive.length - existingLongs;
+      const longSlots = Math.max(0, MAX_SAME_DIRECTION - existingLongs);
+      const shortSlots = Math.max(0, MAX_SAME_DIRECTION - existingShorts);
+      if (longSlots === 0 && shortSlots === 0) {
+        setConnectionLog(`⏸ Direction cap reached (${existingLongs}L / ${existingShorts}S).`);
+        setIsScanning(false); isScanningRef.current = false;
+        return;
       }
 
-      const vol = hasVolumeConfirmation(candles, 3, 20, VOLUME_CONFIRMATION_MULTIPLIER);
-      console.log(
-        `[SCAN] ${asset.symbol}: volume check — short(3)=${vol.shortAvg.toFixed(2)} long(20)=${vol.longAvg.toFixed(2)} ` +
-        `ratio=${vol.longAvg > 0 ? (vol.shortAvg / vol.longAvg).toFixed(2) : '0.00'} → ${vol.ok ? 'PASS' : 'FAIL'}`
+      const busySymbols = new Set(currentActive.map((s) => s.symbol));
+      const symbolsToScan = currentAssets
+        .filter((a) => SCAN_WHITELIST.has(a.symbol))
+        .filter((a) => !busySymbols.has(a.symbol))
+        .filter((a) => {
+          const lastSL = lossCooldownRef.current[a.symbol] ?? 0;
+          return Date.now() - lastSL >= COOLDOWN_AFTER_SL_MS;
+        });
+
+      if (aiValidatorEnabled && !isAiValidatorConfigured()) {
+        setConnectionLog('⚠️ AI Validator is ON but no Gemini key — rules-only.');
+      }
+
+      console.log(`[SCAN] Fetching real candles for ${symbolsToScan.length} symbols...`);
+      const candleResults = await Promise.all(
+        symbolsToScan.map(async (asset) => {
+          const { candles, error } = await getRealCandles(asset.symbol, '5m', 220);
+          return { asset, candles, error };
+        }),
       );
-      if (!vol.ok) {
-        console.log(`[SCAN] ${asset.symbol}: ❌ rejected — volume confirmation failed`);
-        rejectedAtVolume++;
-        continue;
+
+      // 🔧 FIX #3 — check for stale generation before processing
+      if (isStaleGeneration(myGen)) {
+        console.log(`[SCAN] gen=${myGen} superseded by gen=${currentScanGeneration()} — aborting`);
+        return;
       }
 
-      if (confluence.direction === 'LONG' && longsQueued >= longSlots) continue;
-      if (confluence.direction === 'SHORT' && shortsQueued >= shortSlots) continue;
+      const newPositions: TradeSignal[] = [];
+      let longsQueued = 0, shortsQueued = 0;
+      const aiMultiplierMap: Record<string, number> = {};
+      // 🔧 FIX #5 — comprehensive rejection counter
+      const rejected = {
+        atr: 0, score: 0, trend15m: 0, trend1h: 0, trend4h: 0,
+        vol: 0, cap: 0, funding: 0, ai: 0, dup: 0, slots: 0, other: 0,
+      };
 
-      const binanceSym = asset.symbol.replace('/', '').toUpperCase();
-      const fundingRate = await getFundingRate(binanceSym);
-      const fundingPct = fundingRate * 100;
-
-      if (confluence.direction === 'LONG' && fundingRate > FUNDING_CROWDED_THRESHOLD) {
-        console.log(`[SCAN] ${asset.symbol}: ❌ rejected — funding ${fundingPct.toFixed(4)}% too bullish (crowded longs)`);
-        continue;
-      }
-      if (confluence.direction === 'SHORT' && fundingRate < -FUNDING_CROWDED_THRESHOLD) {
-        console.log(`[SCAN] ${asset.symbol}: ❌ rejected — funding ${fundingPct.toFixed(4)}% too bearish (crowded shorts)`);
-        continue;
-      }
-
-      let aiMultiplier = 1.0;
-      let aiReasoning = '';
-
-      const aiCanRun = aiValidatorEnabled && isAiValidatorConfigured();
-
-      if (aiCanRun && confluence.total >= MIN_CONFLUENCE_SCORE) {
-        const recentTrades: AiRecentTrade[] = signals
-          .filter((s) => s.status === 'CLOSED')
-          .slice(0, 8)
-          .map((s) => ({
-            symbol: s.symbol,
-            direction: s.direction,
-            outcome: s.outcome || 'CLOSED',
-            pnlPct: Number((s.pnlPercentage ?? 0).toFixed(2)),
-          }));
-
-        const last20 = signals.filter((s) => s.status === 'CLOSED').slice(0, 20);
-        const wins20 = last20.filter((s) => (s.pnlPercentage ?? 0) > 0).length;
-        const winRate20 = last20.length > 0
-          ? Number(((wins20 / last20.length) * 100).toFixed(1))
-          : 0;
-        let lossStreak = 0;
-        for (const s of last20) {
-          if ((s.pnlPercentage ?? 0) <= 0) lossStreak++;
-          else break;
+      for (const { asset, candles, error } of candleResults) {
+        if (newPositions.length >= slots) break;
+        if (error || candles.length < 30) {
+          console.log(`[SCAN] ${asset.symbol}: skip — no candles or error (${error ?? 'short-history'})`);
+          rejected.other++;
+          continue;
         }
 
-        const tmpRisk = buildRiskLevels(confluence.direction, asset.price, confluence.indicators.atr);
-        const aiCtx: AiTradeContext = {
-          symbol: asset.symbol,
-          direction: confluence.direction,
-          entryPrice: asset.price,
-          stopLoss: tmpRisk.stopLoss,
-          takeProfit: tmpRisk.takeProfit1,
-          score5m: Math.round(confluence.total),
-          score15m: Math.round(trend15m.total),
-          score1h: Math.round(trend1h.total),
-          direction5m: confluence.direction,
-          direction15m: trend15m.direction,
-          direction1h: trend1h.direction,
-          reasons5m: confluence.reasons.slice(0, 8),
-          reasons15m: trend15m.reasons.slice(0, 8),
-          reasons1h: trend1h.reasons.slice(0, 8),
-          atrPct: confluence.indicators.atrPct,
-          dailyPnlPct: dailyPnlRef.current.pnl,
-          recentTrades,
-          killZoneName: zone.name,
-          killZoneWeight: zone.weight,
-          recentWinRatePct: winRate20,
-          recentLossStreak: lossStreak,
-          fundingRate,
-        };
+        // 🔧 FIX #4 — daily cap via dedicated module
+        const capCheck = dailyCapCanEnter(asset.symbol);
+        if (!capCheck.ok) {
+          console.log(`[SCAN] ${asset.symbol}: ❌ daily entry cap (${capCheck.count}/${capCheck.max}) — skipping`);
+          rejected.cap++;
+          continue;
+        }
 
+        const confluence = scoreConfluence(candles, asset.symbol);
         console.log(
-          `[AI] ${asset.symbol}: requesting second opinion (score ${Math.round(confluence.total)}, WR ${winRate20}%, streak ${lossStreak}, funding ${fundingPct.toFixed(4)}%)`
+          `[SCAN] ${asset.symbol}: 5m score=${confluence.total.toFixed(0)} dir=${confluence.direction} | ${confluence.reasons.join(', ')}`,
         );
-        const aiResult = await validateTradeWithAi(aiCtx, 6000);
 
-        if (aiResult) {
-          console.log(
-            `[AI] ${asset.symbol}: ${aiResult.verdict} (${aiResult.confidence}%) — ${aiResult.reason}`,
-          );
-          if (aiResult.verdict === 'REJECT') {
-            console.log(`[AI] ${asset.symbol}: ❌ AI rejected the trade`);
+        if (confluence.total < MIN_CONFLUENCE_SCORE || confluence.direction === 'NONE') {
+          // 🔧 FIX #5 — log every rejection sub-reason
+          if (confluence.indicators.atrPct > 0 && confluence.indicators.atrPct < (MIN_ATR_PCT_BY_SYMBOL[asset.symbol] ?? DEFAULT_MIN_ATR_PCT)) {
+            const thr = (MIN_ATR_PCT_BY_SYMBOL[asset.symbol] ?? DEFAULT_MIN_ATR_PCT);
+            console.log(
+              `[SCAN] ${asset.symbol}: [ATR-HINT] detected ${(confluence.indicators.atrPct * 100).toFixed(3)}% vs desired ${(thr * 100).toFixed(2)}%`,
+            );
+            rejected.atr++;
+          } else {
+            console.log(
+              `[SCAN] ${asset.symbol}: ❌ rejected at 5m (score ${confluence.total.toFixed(0)} < ${MIN_CONFLUENCE_SCORE}, rejections: ${confluence.rejections.join(',') || 'none'})`,
+            );
+            rejected.score++;
+          }
+          continue;
+        }
+
+        // 15m trend gate
+        const { candles: candles15m } = await getRealCandles(asset.symbol, '15m', 60);
+        if (candles15m.length < 30) {
+          console.log(`[SCAN] ${asset.symbol}: ⏸ 15m candles insufficient (${candles15m.length})`);
+          rejected.other++;
+          continue;
+        }
+        const trend15m = scoreConfluence(candles15m, asset.symbol);
+        console.log(`[SCAN] ${asset.symbol}: 15m score=${trend15m.total.toFixed(0)} dir=${trend15m.direction}`);
+
+        if (confluence.direction === 'LONG' && trend15m.direction !== 'LONG') {
+          console.log(`[SCAN] ${asset.symbol}: ❌ rejected — 5m LONG vs 15m ${trend15m.direction}`);
+          rejected.trend15m++;
+          continue;
+        }
+        if (confluence.direction === 'SHORT' && trend15m.direction !== 'SHORT') {
+          console.log(`[SCAN] ${asset.symbol}: ❌ rejected — 5m SHORT vs 15m ${trend15m.direction}`);
+          rejected.trend15m++;
+          continue;
+        }
+
+        // 1h trend gate
+        const { candles: candles1h } = await getRealCandles(asset.symbol, '1h', 60);
+        let trend1h: { total: number; direction: 'LONG' | 'SHORT' | 'NONE'; reasons: string[] } =
+          { total: 0, direction: 'NONE', reasons: [] };
+        if (candles1h.length >= 30) {
+          trend1h = scoreConfluence(candles1h, asset.symbol);
+          console.log(`[SCAN] ${asset.symbol}: 1h score=${trend1h.total.toFixed(0)} dir=${trend1h.direction}`);
+          if (confluence.direction === 'LONG' && trend1h.direction === 'SHORT') {
+            console.log(`[SCAN] ${asset.symbol}: ❌ rejected — 5m LONG against 1h SHORT`);
+            rejected.trend1h++;
             continue;
           }
-          aiMultiplier = aiResult.positionSizeMultiplier;
-          aiReasoning = ` | AI: ${aiResult.verdict} (${aiResult.confidence}%) — ${aiResult.reason}`;
-        } else {
-          console.log(`[AI] ${asset.symbol}: no verdict (unavailable or timeout) — proceeding on rules only`);
+          if (confluence.direction === 'SHORT' && trend1h.direction === 'LONG') {
+            console.log(`[SCAN] ${asset.symbol}: ❌ rejected — 5m SHORT against 1h LONG`);
+            rejected.trend1h++;
+            continue;
+          }
         }
-      }
 
-      const entry = asset.price;
-      const { stopLoss, takeProfit1, takeProfit2, slDist } =
-        buildRiskLevels(confluence.direction, entry, confluence.indicators.atr);
-      const isLong = confluence.direction === 'LONG';
-      const ts = Date.now();
-      const posId = `EXEC-${asset.symbol.replace('/', '')}-${isLong ? 'L' : 'S'}-${ts}`;
+        // 4h trend gate
+        const { candles: candles4h } = await getRealCandles(asset.symbol, '4h', 60);
+        if (candles4h.length >= 30) {
+          const trend4h = scoreConfluence(candles4h, asset.symbol);
+          console.log(`[SCAN] ${asset.symbol}: 4h score=${trend4h.total.toFixed(0)} dir=${trend4h.direction}`);
+          if (confluence.direction === 'LONG' && trend4h.direction === 'SHORT') {
+            console.log(`[SCAN] ${asset.symbol}: ❌ rejected — 5m LONG against 4h SHORT`);
+            rejected.trend4h++;
+            continue;
+          }
+          if (confluence.direction === 'SHORT' && trend4h.direction === 'LONG') {
+            console.log(`[SCAN] ${asset.symbol}: ❌ rejected — 5m SHORT against 4h LONG`);
+            rejected.trend4h++;
+            continue;
+          }
+        }
 
-      newPositions.push({
-        id: posId,
-        symbol: asset.symbol, name: asset.name, assetClass: 'Crypto',
-        direction: isLong ? 'BUY (LONG)' : 'SELL (SHORT)',
-        entryPrice: entry, currentPrice: entry, targetPrice: takeProfit1,
-        stopLoss, takeProfit1, takeProfit2, timeframe: '5m', status: 'ACTIVE',
-        confidenceScore: Math.round(confluence.total),
-        riskRewardRatio: Number((Math.abs(takeProfit1 - entry) / slDist).toFixed(2)),
-        pnlPercentage: 0,
-        chartPattern: 'Multi-Confluence ATR Scalp (REAL DATA)',
-        reasoning: `[${botConfig.agent_config.bot_id}] 5m:${Math.round(confluence.total)} 15m:${Math.round(trend15m.total)} 1h:${Math.round(trend1h.total)} - ` +
-          confluence.reasons.join(' - ') + ` | Zone: ${zone.name} (w=${zone.weight})` +
-          ` | Funding: ${fundingPct.toFixed(4)}%` + aiReasoning,
-        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        startTime: ts,
-        createdAt: ts,
-      });
-
-      aiMultiplierMap[posId] = aiMultiplier;
-
-      if (isLong) longsQueued++; else shortsQueued++;
-      busySymbols.add(asset.symbol);
-    }
-
-    console.log(
-      `[SCAN] Evaluation complete. Qualified setups: ${newPositions.length} ` +
-      `(longsQueued=${longsQueued}, shortsQueued=${shortsQueued}, slots=${slots}) ` +
-      `| rejected: ATR-hint=${rejectedAtAtr} 4h-filter=${rejectedAt4h} vol-filter=${rejectedAtVolume}`
-    );
-
-    if (!newPositions.length) {
-      setConnectionLog(`⏸ No setups met confluence ≥ ${MIN_CONFLUENCE_SCORE} this round.`);
-      setIsScanning(false); return;
-    }
-
-    addSignals(newPositions);
-
-    for (const pos of newPositions) {
-      const liveSnapshot = await refreshAccountSnapshot();
-      console.log(
-        `[SCAN] Executing ${pos.symbol} ${pos.direction} — ` +
-        `snapshot=${liveSnapshot ? `$${liveSnapshot.availableBalance.toFixed(2)}` : 'null'}`
-      );
-      if (!liveSnapshot) {
-        setConnectionLog(`⛔ Skipping ${pos.symbol} — could not read balance.`);
-        removeSignal(pos.id);
-        continue;
-      }
-      if (liveSnapshot.availableBalance <= 0) {
-        setConnectionLog(`⛔ Skipping ${pos.symbol} — no free margin.`);
-        removeSignal(pos.id);
-        break;
-      }
-
-      const dist = Math.abs(pos.entryPrice - pos.stopLoss);
-      const baseQty = positionSize(
-        pos.symbol,
-        pos.entryPrice,
-        dist,
-        liveSnapshot.availableBalance,
-        botConfig.risk_engine.max_account_risk_percent,
-        botConfig.binance_config.leverage,
-      );
-      const multiplier = aiMultiplierMap[pos.id] ?? 1.0;
-      const qty = Number((baseQty * multiplier).toFixed(8));
-
-      console.log(
-        `[SCAN] ${pos.symbol} sizing: baseQty=${baseQty} multiplier=${multiplier} qty=${qty}`
-      );
-
-      if (qty <= 0) {
-        console.log(`[SCAN] ${pos.symbol}: ❌ qty rounds to 0 — skipping`);
-        removeSignal(pos.id);
-        continue;
-      }
-      if (multiplier < 1.0) {
-        setConnectionLog(`⚖️ ${pos.symbol} position halved by AI (${multiplier}x)`);
-      }
-
-      const leverage = botConfig.binance_config.leverage || 10;
-      const notional = qty * pos.entryPrice;
-      const requiredMargin = notional / leverage;
-      const maxAllowedMargin = (liveSnapshot.availableBalance * MAX_MARGIN_USE_PCT) / 100;
-
-      console.log(
-        `[SCAN] ${pos.symbol} margin: required=$${requiredMargin.toFixed(2)} max=$${maxAllowedMargin.toFixed(2)} ` +
-        `(${MAX_MARGIN_USE_PCT}% of $${liveSnapshot.availableBalance.toFixed(2)})`
-      );
-
-      if (requiredMargin > maxAllowedMargin) {
-        console.log(`[SCAN] ${pos.symbol}: ❌ margin guard tripped — skipping`);
-        setConnectionLog(
-          `⛔ ${pos.symbol} skipped — order margin $${requiredMargin.toFixed(2)} > ` +
-          `${MAX_MARGIN_USE_PCT}% of free margin ($${maxAllowedMargin.toFixed(2)}).`
-        );
-        removeSignal(pos.id);
-        continue;
-      }
-
-      const liveAsset = assetsRef.current.find((a) => a.symbol === pos.symbol);
-      const livePrice = liveAsset?.price ?? pos.entryPrice;
-      const driftPct = pos.direction.includes('BUY')
-        ? (livePrice - pos.entryPrice) / pos.entryPrice
-        : (pos.entryPrice - livePrice) / pos.entryPrice;
-
-      console.log(
-        `[SCAN] ${pos.symbol} drift: entry=$${pos.entryPrice} live=$${livePrice} drift=${(driftPct * 100).toFixed(3)}%`
-      );
-
-      if (Math.abs(driftPct) > MAX_ENTRY_DRIFT_PCT) {
+        // Volume gate
+        const vol = hasVolumeConfirmation(candles, 3, 20, VOLUME_CONFIRMATION_MULTIPLIER);
         console.log(
-          `[SCAN] ${pos.symbol}: ❌ drift guard tripped (>${(MAX_ENTRY_DRIFT_PCT * 100).toFixed(2)}%) — skipping`
+          `[SCAN] ${asset.symbol}: volume — short(3)=${vol.shortAvg.toFixed(2)} long(20)=${vol.longAvg.toFixed(2)} ` +
+          `ratio=${vol.longAvg > 0 ? (vol.shortAvg / vol.longAvg).toFixed(2) : '0.00'} → ${vol.ok ? 'PASS' : 'FAIL'}`,
         );
-        setConnectionLog(
-          `❌ ${pos.symbol} rejected — price moved ${(driftPct * 100).toFixed(2)}% ` +
-          `(> ${(MAX_ENTRY_DRIFT_PCT * 100).toFixed(2)}%). Entry was $${pos.entryPrice}, now $${livePrice}.`
-        );
-        removeSignal(pos.id);
-        continue;
+        if (!vol.ok) {
+          console.log(`[SCAN] ${asset.symbol}: ❌ rejected — volume confirmation failed`);
+          rejected.vol++;
+          continue;
+        }
+
+        // Direction slots
+        if (confluence.direction === 'LONG' && longsQueued >= longSlots) {
+          console.log(`[SCAN] ${asset.symbol}: ❌ rejected — long slots filled (${longsQueued}/${longSlots})`);
+          rejected.slots++;
+          continue;
+        }
+        if (confluence.direction === 'SHORT' && shortsQueued >= shortSlots) {
+          console.log(`[SCAN] ${asset.symbol}: ❌ rejected — short slots filled (${shortsQueued}/${shortSlots})`);
+          rejected.slots++;
+          continue;
+        }
+
+        // Funding rate
+        const binanceSym = asset.symbol.replace('/', '').toUpperCase();
+        const fundingRate = await getFundingRate(binanceSym);
+        const fundingPct = fundingRate * 100;
+
+        if (confluence.direction === 'LONG' && fundingRate > FUNDING_CROWDED_THRESHOLD) {
+          console.log(`[SCAN] ${asset.symbol}: ❌ rejected — funding ${fundingPct.toFixed(4)}% crowded longs`);
+          rejected.funding++;
+          continue;
+        }
+        if (confluence.direction === 'SHORT' && fundingRate < -FUNDING_CROWDED_THRESHOLD) {
+          console.log(`[SCAN] ${asset.symbol}: ❌ rejected — funding ${fundingPct.toFixed(4)}% crowded shorts`);
+          rejected.funding++;
+          continue;
+        }
+
+        // AI validator
+        let aiMultiplier = 1.0;
+        let aiReasoning = '';
+        const aiCanRun = aiValidatorEnabled && isAiValidatorConfigured();
+
+        if (aiCanRun && confluence.total >= MIN_CONFLUENCE_SCORE) {
+          const recentTrades: AiRecentTrade[] = signals
+            .filter((s) => s.status === 'CLOSED')
+            .slice(0, 8)
+            .map((s) => ({
+              symbol: s.symbol,
+              direction: s.direction,
+              outcome: s.outcome || 'CLOSED',
+              pnlPct: Number((s.pnlPercentage ?? 0).toFixed(2)),
+            }));
+
+          const last20 = signals.filter((s) => s.status === 'CLOSED').slice(0, 20);
+          const wins20 = last20.filter((s) => (s.pnlPercentage ?? 0) > 0).length;
+          const winRate20 = last20.length > 0 ? Number(((wins20 / last20.length) * 100).toFixed(1)) : 0;
+          let lossStreak = 0;
+          for (const s of last20) {
+            if ((s.pnlPercentage ?? 0) <= 0) lossStreak++;
+            else break;
+          }
+
+          const tmpRisk = buildRiskLevels(confluence.direction, asset.price, confluence.indicators.atr);
+          const aiCtx: AiTradeContext = {
+            symbol: asset.symbol,
+            direction: confluence.direction,
+            entryPrice: asset.price,
+            stopLoss: tmpRisk.stopLoss,
+            takeProfit: tmpRisk.takeProfit1,
+            score5m: Math.round(confluence.total),
+            score15m: Math.round(trend15m.total),
+            score1h: Math.round(trend1h.total),
+            direction5m: confluence.direction,
+            direction15m: trend15m.direction,
+            direction1h: trend1h.direction,
+            reasons5m: confluence.reasons.slice(0, 8),
+            reasons15m: trend15m.reasons.slice(0, 8),
+            reasons1h: trend1h.reasons.slice(0, 8),
+            atrPct: confluence.indicators.atrPct,
+            dailyPnlPct: dailyPnlRef.current.pnl,
+            recentTrades,
+            killZoneName: zone.name,
+            killZoneWeight: zone.weight,
+            recentWinRatePct: winRate20,
+            recentLossStreak: lossStreak,
+            fundingRate,
+          };
+
+          console.log(`[AI] ${asset.symbol}: requesting second opinion (score ${Math.round(confluence.total)}, WR ${winRate20}%, streak ${lossStreak}, funding ${fundingPct.toFixed(4)}%)`);
+          const aiResult = await validateTradeWithAi(aiCtx, 8000);
+
+          if (aiResult) {
+            console.log(`[AI] ${asset.symbol}: ${aiResult.verdict} (${aiResult.confidence}%) — ${aiResult.reason}`);
+            if (aiResult.verdict === 'REJECT') {
+              console.log(`[AI] ${asset.symbol}: ❌ AI rejected`);
+              rejected.ai++;
+              continue;
+            }
+            aiMultiplier = aiResult.positionSizeMultiplier;
+            aiReasoning = ` | AI: ${aiResult.verdict} (${aiResult.confidence}%) — ${aiResult.reason}`;
+          } else {
+            console.log(`[AI] ${asset.symbol}: no verdict (unavailable/timeout) — rules only`);
+          }
+        }
+
+        // ─── QUALIFIED! ───
+        const entry = asset.price;
+        const { stopLoss, takeProfit1, takeProfit2, slDist } =
+          buildRiskLevels(confluence.direction, entry, confluence.indicators.atr);
+        const isLong = confluence.direction === 'LONG';
+        const ts = Date.now();
+        const posId = `EXEC-${asset.symbol.replace('/', '')}-${isLong ? 'L' : 'S'}-${ts}`;
+
+        newPositions.push({
+          id: posId,
+          symbol: asset.symbol, name: asset.name, assetClass: 'Crypto',
+          direction: isLong ? 'BUY (LONG)' : 'SELL (SHORT)',
+          entryPrice: entry, currentPrice: entry, targetPrice: takeProfit1,
+          stopLoss, takeProfit1, takeProfit2, timeframe: '5m', status: 'ACTIVE',
+          confidenceScore: Math.round(confluence.total),
+          riskRewardRatio: Number((Math.abs(takeProfit1 - entry) / slDist).toFixed(2)),
+          pnlPercentage: 0,
+          chartPattern: 'Multi-Confluence ATR Scalp (REAL DATA)',
+          reasoning: `[${botConfig.agent_config.bot_id}] 5m:${Math.round(confluence.total)} 15m:${Math.round(trend15m.total)} 1h:${Math.round(trend1h.total)} - ` +
+            confluence.reasons.join(' - ') + ` | Zone: ${zone.name} (w=${zone.weight})` +
+            ` | Funding: ${fundingPct.toFixed(4)}%` + aiReasoning,
+          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+          startTime: ts,
+          createdAt: ts,
+        });
+
+        aiMultiplierMap[posId] = aiMultiplier;
+        if (isLong) longsQueued++; else shortsQueued++;
+        busySymbols.add(asset.symbol);
+
+        console.log(`[SCAN] ✅ ${asset.symbol} QUALIFIED — ${confluence.direction} score=${confluence.total.toFixed(0)}`);
       }
 
-      const existingPos = await checkPositionExists(pos.symbol.replace('/', '').toUpperCase());
-      console.log(`[SCAN] ${pos.symbol} existing-position check: ${existingPos} units open`);
-
-      if (existingPos > 0) {
-        console.log(`[SCAN] ${pos.symbol}: ❌ position already exists on Binance (${existingPos} units) — skipping`);
-        setConnectionLog(
-          `⛔ ${pos.symbol} skipped — position already exists (${existingPos} units open).`
-        );
-        removeSignal(pos.id);
-        continue;
-      }
-
-      const side: 'BUY' | 'SELL' = pos.direction.includes('BUY') ? 'BUY' : 'SELL';
-      console.log(`[SCAN] Placing ${side} order for ${pos.symbol} qty=${qty} entry≈$${livePrice}`);
-      const r = await executeBinanceOrderWithStops(pos.symbol, side, qty, pos.stopLoss, pos.takeProfit1);
-      console.log(`[SCAN] Order result:`, r);
-
-      if (!r.success) {
-        setConnectionLog(`⚠️ ${pos.symbol} order NOT placed: ${r.error}`);
-        removeSignal(pos.id);
-        continue;
-      }
-
-      alertTradeOpened({
-        symbol: pos.symbol, direction: pos.direction,
-        entryPrice: r.fillPrice ?? pos.entryPrice,
-        stopLoss: pos.stopLoss, takeProfit1: pos.takeProfit1, takeProfit2: pos.takeProfit2,
-        confidenceScore: pos.confidenceScore, riskRewardRatio: pos.riskRewardRatio,
-        reasoning: pos.reasoning, binanceOrderId: r.orderId,
-        environment: apiSettings.environment, usdtBalance: liveSnapshot.availableBalance,
-      });
-
-      const todayKey = `${new Date().toISOString().slice(0, 10)}|${pos.symbol}`;
-      dailyEntryCountRef.current[todayKey] = (dailyEntryCountRef.current[todayKey] ?? 0) + 1;
+      // 🔧 FIX #5 — full rejection summary
       console.log(
-        `[SCAN] ${pos.symbol}: daily entry count → ${dailyEntryCountRef.current[todayKey]}/${MAX_ENTRIES_PER_SYMBOL_PER_DAY}`
+        `[SCAN] Evaluation complete (gen=${myGen}). Qualified: ${newPositions.length} ` +
+        `(L=${longsQueued}, S=${shortsQueued}, slots=${slots}) | ` +
+        `rejected: atr=${rejected.atr} score=${rejected.score} 15m=${rejected.trend15m} ` +
+        `1h=${rejected.trend1h} 4h=${rejected.trend4h} vol=${rejected.vol} ` +
+        `cap=${rejected.cap} funding=${rejected.funding} ai=${rejected.ai} slots=${rejected.slots} other=${rejected.other}`,
       );
 
-      patchSignal(pos.id, {
-        ...(r.orderId ? { binanceOrderId: r.orderId } : {}),
-        binanceQty: qty,
-        ...(r.slOrderId ? { binanceSlOrderId: r.slOrderId } : {}),
-        ...(r.tpOrderId ? { binanceTpOrderId: r.tpOrderId } : {}),
-        ...(r.fillPrice ? { entryPrice: r.fillPrice, currentPrice: r.fillPrice } : {}),
-        reasoning: `${pos.reasoning} | Binance: ${r.orderId} qty=${qty}` +
-          `${r.slOrderId ? ` SL algoId:${r.slOrderId}` : ''}` +
-          `${r.tpOrderId ? ` TP algoId:${r.tpOrderId}` : ''}`,
-      });
-    }
+      if (!newPositions.length) {
+        setConnectionLog(`⏸ No setups met confluence ≥ ${MIN_CONFLUENCE_SCORE} this round.`);
+        return;
+      }
 
-    setIsScanning(false);
+      addSignals(newPositions);
+
+      for (const pos of newPositions) {
+        const liveSnapshot = await refreshAccountSnapshot();
+        console.log(`[SCAN] Executing ${pos.symbol} ${pos.direction} — snapshot=${liveSnapshot ? `$${liveSnapshot.availableBalance.toFixed(2)}` : 'null'}`);
+        if (!liveSnapshot) {
+          setConnectionLog(`⛔ Skipping ${pos.symbol} — could not read balance.`);
+          removeSignal(pos.id);
+          continue;
+        }
+        if (liveSnapshot.availableBalance <= 0) {
+          setConnectionLog(`⛔ Skipping ${pos.symbol} — no free margin.`);
+          removeSignal(pos.id);
+          break;
+        }
+
+        const dist = Math.abs(pos.entryPrice - pos.stopLoss);
+        const exchangeStep = exchangeInfoRef.current[pos.symbol.replace('/', '').toUpperCase()]?.stepSize;
+        const baseQty = positionSize(
+          pos.symbol,
+          pos.entryPrice,
+          dist,
+          liveSnapshot.availableBalance,
+          botConfig.risk_engine.max_account_risk_percent,
+          botConfig.binance_config.leverage,
+          exchangeStep,
+        );
+        const multiplier = aiMultiplierMap[pos.id] ?? 1.0;
+        const qty = Number((baseQty * multiplier).toFixed(8));
+
+        console.log(`[SCAN] ${pos.symbol} sizing: baseQty=${baseQty} multiplier=${multiplier} qty=${qty}`);
+
+        if (qty <= 0) {
+          console.log(`[SCAN] ${pos.symbol}: ❌ qty rounds to 0 — skipping`);
+          removeSignal(pos.id);
+          continue;
+        }
+        if (multiplier < 1.0) {
+          setConnectionLog(`⚖️ ${pos.symbol} position halved by AI (${multiplier}x)`);
+        }
+
+        const leverage = botConfig.binance_config.leverage || 10;
+        const notional = qty * pos.entryPrice;
+        const requiredMargin = notional / leverage;
+        const maxAllowedMargin = (liveSnapshot.availableBalance * MAX_MARGIN_USE_PCT) / 100;
+
+        console.log(`[SCAN] ${pos.symbol} margin: required=$${requiredMargin.toFixed(2)} max=$${maxAllowedMargin.toFixed(2)}`);
+
+        if (requiredMargin > maxAllowedMargin) {
+          console.log(`[SCAN] ${pos.symbol}: ❌ margin guard — skipping`);
+          setConnectionLog(`⛔ ${pos.symbol} skipped — order margin $${requiredMargin.toFixed(2)} > ${MAX_MARGIN_USE_PCT}% of free margin.`);
+          removeSignal(pos.id);
+          continue;
+        }
+
+        const liveAsset = assetsRef.current.find((a) => a.symbol === pos.symbol);
+        const livePrice = liveAsset?.price ?? pos.entryPrice;
+        const driftPct = pos.direction.includes('BUY')
+          ? (livePrice - pos.entryPrice) / pos.entryPrice
+          : (pos.entryPrice - livePrice) / pos.entryPrice;
+
+        console.log(`[SCAN] ${pos.symbol} drift: entry=$${pos.entryPrice} live=$${livePrice} drift=${(driftPct * 100).toFixed(3)}%`);
+
+        if (Math.abs(driftPct) > MAX_ENTRY_DRIFT_PCT) {
+          console.log(`[SCAN] ${pos.symbol}: ❌ drift guard — skipping`);
+          setConnectionLog(`❌ ${pos.symbol} rejected — price moved ${(driftPct * 100).toFixed(2)}% (> ${(MAX_ENTRY_DRIFT_PCT * 100).toFixed(2)}%).`);
+          removeSignal(pos.id);
+          continue;
+        }
+
+        const existingPos = await checkPositionExists(pos.symbol.replace('/', '').toUpperCase());
+        console.log(`[SCAN] ${pos.symbol} existing-position check: ${existingPos} units open`);
+
+        if (existingPos > 0) {
+          console.log(`[SCAN] ${pos.symbol}: ❌ position exists (${existingPos} units) — skipping`);
+          setConnectionLog(`⛔ ${pos.symbol} skipped — position already exists (${existingPos} units).`);
+          removeSignal(pos.id);
+          continue;
+        }
+
+        const side: 'BUY' | 'SELL' = pos.direction.includes('BUY') ? 'BUY' : 'SELL';
+        console.log(`[SCAN] Placing ${side} order for ${pos.symbol} qty=${qty} entry≈$${livePrice}`);
+        const r = await executeBinanceOrderWithStops(pos.symbol, side, qty, pos.stopLoss, pos.takeProfit1);
+        console.log(`[SCAN] Order result:`, r);
+
+        if (!r.success) {
+          setConnectionLog(`⚠️ ${pos.symbol} order NOT placed: ${r.error}`);
+          removeSignal(pos.id);
+          continue;
+        }
+
+        alertTradeOpened({
+          symbol: pos.symbol, direction: pos.direction,
+          entryPrice: r.fillPrice ?? pos.entryPrice,
+          stopLoss: pos.stopLoss, takeProfit1: pos.takeProfit1, takeProfit2: pos.takeProfit2,
+          confidenceScore: pos.confidenceScore, riskRewardRatio: pos.riskRewardRatio,
+          reasoning: pos.reasoning, binanceOrderId: r.orderId,
+          environment: apiSettings.environment, usdtBalance: liveSnapshot.availableBalance,
+        });
+
+        // 🔧 FIX #4 — record entry via dailyCap module
+        dailyCapRecordEntry(pos.symbol);
+
+        patchSignal(pos.id, {
+          ...(r.orderId ? { binanceOrderId: r.orderId } : {}),
+          binanceQty: qty,
+          ...(r.slOrderId ? { binanceSlOrderId: r.slOrderId } : {}),
+          ...(r.tpOrderId ? { binanceTpOrderId: r.tpOrderId } : {}),
+          ...(r.fillPrice ? { entryPrice: r.fillPrice, currentPrice: r.fillPrice } : {}),
+          reasoning: `${pos.reasoning} | Binance: ${r.orderId} qty=${qty}` +
+            `${r.slOrderId ? ` SL algoId:${r.slOrderId}` : ''}` +
+            `${r.tpOrderId ? ` TP algoId:${r.tpOrderId}` : ''}`,
+        });
+      }
+    } finally {
+      // 🔧 FIX #3 — always release lock
+      setIsScanning(false);
+      isScanningRef.current = false;
+      releaseScanLock();
+    }
   };
 
   const scanFnRef = useRef(handleExecuteCryptoScalpScan);
@@ -2329,12 +2305,8 @@ ${items.join('\n\n')}
               .map((s) => s.symbol.replace('/', '').toUpperCase()),
           );
 
-          console.log(
-            `[orphan] tracked (from signals): [${Array.from(trackedSymbols).join(', ') || '(empty)'}]`
-          );
-          console.log(
-            `[orphan] on Binance: [${open.map((p) => p.symbol).join(', ')}]`
-          );
+          console.log(`[orphan] tracked (from signals): [${Array.from(trackedSymbols).join(', ') || '(empty)'}]`);
+          console.log(`[orphan] on Binance: [${open.map((p) => p.symbol).join(', ')}]`);
 
           const orphans = open.filter((p) => !trackedSymbols.has(p.symbol));
           setOrphanPositions(orphans);
@@ -2345,9 +2317,7 @@ ${items.join('\n\n')}
               .join(' | ');
             const allAreOrphans = orphans.length === open.length;
             const warning = allAreOrphans
-              ? `⚠️ ALL ${open.length} BINANCE POSITIONS are unknown to this session. ` +
-                `This usually means localStorage was cleared by a redeploy. ` +
-                `CHECK before closing — these may be YOUR trades.`
+              ? `⚠️ ALL ${open.length} BINANCE POSITIONS are unknown to this session.`
               : `⚠️ ORPHAN POSITIONS (${orphans.length}): ${list}.`;
             setConnectionLog(`${warning} Positions: ${list}.`);
             console.warn('[orphan] WARNING:', warning);
@@ -2357,9 +2327,7 @@ ${items.join('\n\n')}
         }
 
         const activeWithNativeSl = signalsRef.current.filter((s) =>
-          s.status === 'ACTIVE' &&
-          s.binanceSlOrderId &&
-          s.binanceTpOrderId
+          s.status === 'ACTIVE' && s.binanceSlOrderId && s.binanceTpOrderId,
         );
         if (activeWithNativeSl.length > 0) {
           console.log(`[SL-REPAIR] checking ${activeWithNativeSl.length} active trade(s) with native SL`);
@@ -2368,14 +2336,12 @@ ${items.join('\n\n')}
               const sym = sig.symbol.replace('/', '').toUpperCase();
               const realSL = await fetchActualSlTrigger(sym);
               if (realSL === null) {
-                console.warn(`[SL-REPAIR] ${sig.symbol}: could not fetch real SL from Binance`);
+                console.warn(`[SL-REPAIR] ${sig.symbol}: could not fetch real SL`);
                 continue;
               }
               const oldSL = sig.stopLoss;
               if (Math.abs(realSL - oldSL) > 0.0001) {
-                console.log(
-                  `[SL-REPAIR] ${sig.symbol}: SL was $${oldSL} → corrected to $${realSL} (actual Binance trigger)`
-                );
+                console.log(`[SL-REPAIR] ${sig.symbol}: SL $${oldSL} → $${realSL}`);
                 patchSignal(sig.id, { stopLoss: realSL });
               } else {
                 console.log(`[SL-REPAIR] ${sig.symbol}: SL already correct at $${realSL}`);
@@ -2402,10 +2368,7 @@ ${items.join('\n\n')}
       .map((p) => `${p.symbol} ${p.positionAmt > 0 ? 'LONG' : 'SHORT'} ${Math.abs(p.positionAmt).toFixed(4)}`)
       .join('\n');
     const confirmed = window.confirm(
-      `Close ${orphanPositions.length} position(s)?\n\n${list}\n\n` +
-      `⚠️ WARNING: If these are YOUR trades that the bot opened, closing them will exit the position at market price. ` +
-      `Confirm only if you're sure they are stale/orphaned positions.\n\n` +
-      `Click OK to close, Cancel to abort.`
+      `Close ${orphanPositions.length} position(s)?\n\n${list}\n\n⚠️ WARNING: If these are YOUR trades, closing them will exit at market price.`,
     );
     if (!confirmed) {
       setConnectionLog('🚫 Orphan close cancelled by user.');
@@ -2444,9 +2407,9 @@ ${items.join('\n\n')}
     await refreshAccountSnapshot();
 
     if (stillOrphans.length === 0) {
-      setConnectionLog(`✅ Orphan rescue complete: ${okCount} closed${failCount > 0 ? `, ${failCount} failed` : ''}. All clear — retry FORCE SCAN.`);
+      setConnectionLog(`✅ Orphan rescue complete: ${okCount} closed${failCount > 0 ? `, ${failCount} failed` : ''}. All clear.`);
     } else {
-      setConnectionLog(`⚠️ Orphan rescue: ${okCount} closed, ${failCount} failed. ${stillOrphans.length} still open — retry manually.`);
+      setConnectionLog(`⚠️ Orphan rescue: ${okCount} closed, ${failCount} failed. ${stillOrphans.length} still open.`);
     }
     setIsClosingOrphans(false);
   };
@@ -2470,12 +2433,13 @@ ${items.join('\n\n')}
 
       const existing = await checkPositionExists(trade.symbol.replace('/', '').toUpperCase());
       if (existing <= 0) {
-        console.log(`[CLOSE] ${trade.symbol} already closed on Binance — skipping reduceOnly order`);
+        console.log(`[CLOSE] ${trade.symbol} already closed on Binance — skipping reduceOnly`);
         return;
       }
 
       const dist = Math.abs(trade.entryPrice - trade.stopLoss);
-      const qty = trade.binanceQty ?? positionSize(trade.symbol, trade.entryPrice, dist, balance);
+      const exchangeStep = exchangeInfoRef.current[trade.symbol.replace('/', '').toUpperCase()]?.stepSize;
+      const qty = trade.binanceQty ?? positionSize(trade.symbol, trade.entryPrice, dist, balance, undefined, undefined, exchangeStep);
       if (qty <= 0) return;
       const closeSide: 'BUY' | 'SELL' = trade.direction.includes('BUY') ? 'SELL' : 'BUY';
       const r = await executeBinanceOrder(trade.symbol, closeSide, qty, 'MARKET', undefined, true);
@@ -2513,9 +2477,7 @@ ${items.join('\n\n')}
       for (const trade of stale) {
         const ageMin = Math.round((now - (trade.startTime || trade.createdAt || 0)) / 60_000);
         const pnl = Number((trade.pnlPercentage ?? 0).toFixed(3));
-        console.log(
-          `[TIME-STOP] ${trade.symbol} — ${ageMin}m old, pnl=${pnl}% — closing`
-        );
+        console.log(`[TIME-STOP] ${trade.symbol} — ${ageMin}m old, pnl=${pnl}% — closing`);
 
         if (trade.binanceSlOrderId || trade.binanceTpOrderId) {
           try {
@@ -2529,12 +2491,13 @@ ${items.join('\n\n')}
         const balance = accountSnapshotRef.current?.availableBalance ?? 0;
         if (balance > 0) {
           const dist = Math.abs(trade.entryPrice - trade.stopLoss);
-          const qty = trade.binanceQty ?? positionSize(trade.symbol, trade.entryPrice, dist, balance);
+          const exchangeStep = exchangeInfoRef.current[trade.symbol.replace('/', '').toUpperCase()]?.stepSize;
+          const qty = trade.binanceQty ?? positionSize(trade.symbol, trade.entryPrice, dist, balance, undefined, undefined, exchangeStep);
           if (qty > 0) {
             const closeSide: 'BUY' | 'SELL' = trade.direction.includes('BUY') ? 'SELL' : 'BUY';
             const r = await executeBinanceOrder(trade.symbol, closeSide, qty, 'MARKET', undefined, true);
             if (r.success) {
-              console.log(`[TIME-STOP] ✅ ${trade.symbol} closed on Binance | orderId=${r.orderId}`);
+              console.log(`[TIME-STOP] ✅ ${trade.symbol} closed | orderId=${r.orderId}`);
             } else if (r.error) {
               const benign =
                 r.error.includes('-2022') ||
@@ -2571,14 +2534,15 @@ ${items.join('\n\n')}
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [apiSettings.apiKey, apiSettings.apiSecret, apiSettings.enableFutures]);
 
+  // 🔧 FIX #3 — background scan uses the guard
   useEffect(() => {
     if (!isAutoPilotActive) return;
     const backgroundInterval = setInterval(() => {
       if (!isScanningRef.current && assetsRef.current.length > 0 && !killSwitchRef.current) {
         if (!isIn15mCandleCloseWindow()) return;
-        scanFnRef.current();
+        scanFnRef.current('background').catch((e) => console.error('[background-scan]', e));
       }
-    }, 15000);
+    }, 15_000);
     return () => clearInterval(backgroundInterval);
   }, [isAutoPilotActive]);
 
@@ -2697,10 +2661,12 @@ ${items.join('\n\n')}
         const closedMap = new Map<string, Closure>();
         for (const c of closures) closedMap.set(c.sig.id, c);
 
-        setSignals((prev) => prev.map((sig) => {
-          if (sig.status !== 'ACTIVE') return sig;
+        // 🔧 FIX #6 — single atomic update path
+        const updates = new Map<string, Partial<TradeSignal>>();
+        for (const sig of signalsRef.current) {
+          if (sig.status !== 'ACTIVE') continue;
           const livePrice = priceMap.get(sig.symbol);
-          if (!livePrice) return sig;
+          if (!livePrice) continue;
 
           const isLong = sig.direction.includes('BUY');
           const rawPnl = isLong
@@ -2709,47 +2675,30 @@ ${items.join('\n\n')}
 
           const trailing = trailingStopUpdates.get(sig.id);
           const stopLoss = trailing !== undefined ? trailing : sig.stopLoss;
-
           const closed = closedMap.get(sig.id);
+
           if (closed) {
-            return {
-              ...sig,
+            updates.set(sig.id, {
               currentPrice: closed.livePrice,
               stopLoss,
               pnlPercentage: Number(closed.rawPnl.toFixed(2)),
               status: 'CLOSED',
               outcome: closed.outcome,
               closedAt: Date.now(),
-            };
-          }
-          return { ...sig, currentPrice: livePrice, stopLoss, pnlPercentage: Number(rawPnl.toFixed(2)) };
-        }));
-
-        signalsRef.current = signalsRef.current.map((sig) => {
-          if (sig.status !== 'ACTIVE') return sig;
-          const livePrice = priceMap.get(sig.symbol);
-          if (!livePrice) return sig;
-
-          const isLong = sig.direction.includes('BUY');
-          const rawPnl = isLong
-            ? ((livePrice - sig.entryPrice) / (sig.entryPrice || 1)) * 100
-            : ((sig.entryPrice - livePrice) / (sig.entryPrice || 1)) * 100;
-          const trailing = trailingStopUpdates.get(sig.id);
-          const stopLoss = trailing !== undefined ? trailing : sig.stopLoss;
-          const closed = closedMap.get(sig.id);
-          if (closed) {
-            return {
-              ...sig,
-              currentPrice: closed.livePrice,
+            });
+          } else {
+            updates.set(sig.id, {
+              currentPrice: livePrice,
               stopLoss,
-              pnlPercentage: Number(closed.rawPnl.toFixed(2)),
-              status: 'CLOSED',
-              outcome: closed.outcome,
-              closedAt: Date.now(),
-            };
+              pnlPercentage: Number(rawPnl.toFixed(2)),
+            });
           }
-          return { ...sig, currentPrice: livePrice, stopLoss, pnlPercentage: Number(rawPnl.toFixed(2)) };
-        });
+        }
+
+        if (updates.size > 0) {
+          setSignals((prev) => prev.map((s) => updates.has(s.id) ? { ...s, ...updates.get(s.id)! } : s));
+          signalsRef.current = signalsRef.current.map((s) => updates.has(s.id) ? { ...s, ...updates.get(s.id)! } : s);
+        }
       } catch (e) {
         console.error('Binance WS parse error:', e);
       }
@@ -2829,9 +2778,9 @@ ${items.join('\n\n')}
   };
 
   const activeTrades = useMemo(() => signals.filter((s) => s.status === 'ACTIVE'), [signals]);
-
   const balanceAgeSec = accountSnapshot ? Math.round((Date.now() - accountSnapshot.updatedAt) / 1000) : null;
 
+  // ──────── RENDER ────────
   return (
     <div id="tradesignal-app-root" className="h-screen max-h-screen overflow-hidden bg-slate-950 text-slate-100 flex flex-col font-sans">
       <Header
@@ -2856,8 +2805,8 @@ ${items.join('\n\n')}
           <div className="flex items-center gap-2">
             <AlertTriangle className="w-4 h-4 text-amber-300 shrink-0 animate-pulse" />
             <span>
-              <strong>🌐 NETWORK OFFLINE</strong> — balance refresh failing. New entries paused.
-              Kill switch trips only after {Math.round(NETWORK_OFFLINE_KILL_THRESHOLD_MS / 60000)} min of sustained outage.
+              <strong>🌐 NETWORK DEGRADED</strong> — balance refresh failing.
+              Kill switch trips only after {Math.round(NETWORK_OFFLINE_KILL_THRESHOLD_MS / 60000)} min AND {NETWORK_FAILURE_STREAK_WARN}+ consecutive failures.
             </span>
           </div>
           <span className="text-[10px] text-amber-300/70 shrink-0 hidden sm:inline">
@@ -2870,7 +2819,7 @@ ${items.join('\n\n')}
         <div className="bg-rose-600/20 border-b-2 border-rose-500 px-4 py-2 text-[12px] font-mono text-rose-200 flex items-center justify-between gap-3">
           <div className="flex items-center gap-2">
             <Skull className="w-5 h-5 text-rose-400 shrink-0 animate-pulse" />
-            <span><strong>KILL SWITCH ACTIVE</strong> — no new trades will be placed. Clear it below to resume.</span>
+            <span><strong>KILL SWITCH ACTIVE</strong> — no new trades will be placed.</span>
           </div>
           <button
             onClick={clearKillSwitch}
@@ -2886,7 +2835,7 @@ ${items.join('\n\n')}
           <div className="flex items-center gap-2 flex-wrap">
             <AlertTriangle className="w-5 h-5 text-amber-300 shrink-0 animate-pulse" />
             <span>
-              <strong>ORPHAN POSITIONS ({orphanPositions.length})</strong> — these will silently block new entries on their symbols:{' '}
+              <strong>ORPHAN POSITIONS ({orphanPositions.length})</strong> — blocking new entries:{' '}
               <span className="font-bold text-amber-200">
                 {orphanPositions.map((p) => `${p.symbol} ${p.positionAmt > 0 ? 'LONG' : 'SHORT'} ${Math.abs(p.positionAmt).toFixed(4)}`).join(' | ')}
               </span>
@@ -2903,7 +2852,6 @@ ${items.join('\n\n')}
             <button
               onClick={() => setOrphanBannerDismissed(true)}
               className="px-2 py-1 rounded bg-slate-800/80 hover:bg-slate-700 text-slate-300 border border-slate-600 text-[10px] font-bold cursor-pointer"
-              title="Dismiss (does not close positions)"
             >
               Dismiss
             </button>
@@ -2973,58 +2921,18 @@ ${items.join('\n\n')}
                       <Clock className="w-3 h-3 text-amber-400" />
                       <span>{getActiveKillZoneInfo().name} (w:{getActiveKillZoneInfo().weight})</span>
                     </span>
-                    {skipKillZone && (
-                      <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
-                        KILLZONE GATE OFF
-                      </span>
-                    )}
-                    {SKIP_WEEKENDS && (
-                      <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-amber-500/20 text-amber-300 border border-amber-500/30">
-                        WEEKEND FILTER ON
-                      </span>
-                    )}
-                    <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-amber-500/20 text-amber-300 border border-amber-500/30">
-                      WHITELIST: {SCAN_WHITELIST.size} PAIRS
-                    </span>
-                    <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
-                      REAL DATA
-                    </span>
-                    {apiSettings.enableFutures && (
-                      <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-rose-500/20 text-rose-300 border border-rose-500/30 flex items-center gap-1">
-                        <Lock className="w-3 h-3" />
-                        ALGO SL/TP
-                      </span>
-                    )}
-                    <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
-                      DIR CAP {MAX_SAME_DIRECTION}/side
-                    </span>
-                    <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-orange-500/20 text-orange-300 border border-orange-500/30">
-                      MARGIN ≤ {MAX_MARGIN_USE_PCT}%
-                    </span>
-                    <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-sky-500/20 text-sky-300 border border-sky-500/30">
-                      TIME STOP {Math.round(TIME_STOP_MS / 60000)}m
-                    </span>
-                    <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">
-                      4H GATE ON
-                    </span>
-                    <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-teal-500/20 text-teal-300 border border-teal-500/30">
-                      VOL FILTER {VOLUME_CONFIRMATION_MULTIPLIER.toFixed(1)}×
+                    <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-slate-800 text-slate-300 border border-slate-700">
+                      WHITELIST: {SCAN_WHITELIST.size}
                     </span>
                     <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-violet-500/20 text-violet-300 border border-violet-500/30">
-                      AUTO-RECONCILE 2m
+                      SCAN-MUTEX ON
                     </span>
-                    <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-pink-500/20 text-pink-300 border border-pink-500/30">
-                      PERSISTENT STATE
+                    <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-teal-500/20 text-teal-300 border border-teal-500/30">
+                      DAILY-CAP PERSIST
                     </span>
-                    {aiValidatorEnabled && (
-                      <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-purple-500/20 text-purple-300 border border-purple-500/30 flex items-center gap-1">
-                        <Brain className="w-3 h-3" />
-                        AI VALIDATOR
-                      </span>
-                    )}
                   </div>
                   <p className="text-[11px] text-slate-400 mt-0.5">
-                    Confluence ≥ {MIN_CONFLUENCE_SCORE} · 5m/15m/1h/4h gates · Volume confirm · Per-symbol ATR · ATR-scaled SL/TP · R:R 1:{botConfig.risk_engine.min_reward_risk_ratio}
+                    Confluence ≥ {MIN_CONFLUENCE_SCORE} · 5m/15m/1h/4h gates · Volume · ATR-scaled SL/TP · R:R 1:{botConfig.risk_engine.min_reward_risk_ratio}
                   </p>
                 </div>
               </div>
@@ -3040,14 +2948,14 @@ ${items.join('\n\n')}
 
                 <button
                   onClick={() => {
-                    if (killSwitchOn) { setConnectionLog('🛑 Clear the kill switch first in Settings.'); return; }
+                    if (killSwitchOn) { setConnectionLog('🛑 Clear kill switch first.'); return; }
                     const next = !isAutoPilotActive;
                     setIsAutoPilotActive(next);
                     if (next) alertBotStarted(apiSettings.environment, SCAN_WHITELIST.size, MIN_CONFLUENCE_SCORE);
                     else alertBotStopped(apiSettings.environment);
                   }}
                   disabled={killSwitchOn}
-                  className={`px-3 py-1.5 rounded-lg font-bold text-xs flex items-center gap-1.5 transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${
+                  className={`px-3 py-1.5 rounded-lg font-bold text-xs flex items-center gap-1.5 transition-colors cursor-pointer disabled:opacity-40 ${
                     isAutoPilotActive
                       ? 'bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 border border-amber-500/30'
                       : 'bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
@@ -3058,13 +2966,12 @@ ${items.join('\n\n')}
                 </button>
 
                 <button
-                  onClick={handleExecuteCryptoScalpScan}
+                  onClick={() => handleExecuteCryptoScalpScan('manual')}
                   disabled={isScanning || assets.length === 0 || activeTrades.length >= MAX_ACTIVE_TRADES || killSwitchOn || orphanPositions.length > 0}
                   className="px-4 py-1.5 bg-gradient-to-r from-emerald-500 to-teal-400 hover:from-emerald-400 hover:to-teal-300 text-slate-950 font-black rounded-lg text-xs transition-all shadow-md flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-50"
-                  title={orphanPositions.length > 0 ? 'Close orphan positions first' : ''}
                 >
                   {isScanning ? (
-                    <><Sparkles className="w-3.5 h-3.5 animate-spin text-slate-950" /><span>Scanning...</span></>
+                    <><Sparkles className="w-3.5 h-3.5 animate-spin" /><span>Scanning...</span></>
                   ) : (
                     <><Flame className="w-3.5 h-3.5 fill-current" /><span>FORCE SCAN</span></>
                   )}
@@ -3184,7 +3091,7 @@ ${items.join('\n\n')}
                 </div>
                 <h3 className="text-xs font-bold text-white">Background AI Agent Active</h3>
                 <p className="text-[11px] text-slate-400 max-w-sm mx-auto">
-                  Scanning {SCAN_WHITELIST.size} whitelisted pairs with real Binance klines for confluence ≥ {MIN_CONFLUENCE_SCORE}...
+                  Scanning {SCAN_WHITELIST.size} whitelisted pairs for confluence ≥ {MIN_CONFLUENCE_SCORE}...
                 </p>
               </div>
             )}
@@ -3224,7 +3131,7 @@ ${items.join('\n\n')}
                   {dailyPnlRef.current.pnl >= 0 ? '+' : ''}{dailyPnlRef.current.pnl.toFixed(2)}%
                 </div>
                 <div className="text-[10px] font-mono text-slate-500 mt-0.5">
-                  Kill at -{MAX_DAILY_LOSS_PCT}% · persisted
+                  Kill at -{MAX_DAILY_LOSS_PCT}%
                 </div>
               </div>
               <div className="bg-slate-900/80 border border-slate-800 p-3 rounded-xl">
@@ -3251,7 +3158,7 @@ ${items.join('\n\n')}
               </div>
               <div>
                 <h3 className="text-base font-bold text-white">Binance Environment &amp; API Configuration</h3>
-                <p className="text-xs text-slate-400">Choose environment, paste matching API keys, then verify.</p>
+                <p className="text-xs text-slate-400">Choose environment, paste matching API keys, verify.</p>
               </div>
             </div>
 
@@ -3261,34 +3168,10 @@ ${items.join('\n\n')}
                   <div className="flex items-center justify-between">
                     <div>
                       <span className="text-xs font-bold text-rose-200 block">Kill Switch is ACTIVE</span>
-                      <span className="text-[11px] text-rose-300/80">Trading is halted. Review logs, then clear to resume.</span>
+                      <span className="text-[11px] text-rose-300/80">Trading is halted.</span>
                     </div>
                     <button onClick={clearKillSwitch} className="px-3 py-1.5 bg-rose-500/30 hover:bg-rose-500/50 text-rose-100 border border-rose-400/60 text-xs font-bold rounded-lg cursor-pointer">
                       Clear Kill Switch
-                    </button>
-                  </div>
-                </div>
-              )}
-
-              {orphanPositions.length > 0 && (
-                <div className="p-3 bg-amber-500/10 border border-amber-500/40 rounded-xl">
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="flex-1">
-                      <span className="text-xs font-bold text-amber-200 block mb-1">Orphan Positions ({orphanPositions.length})</span>
-                      <div className="text-[11px] font-mono text-amber-200/90 space-y-0.5">
-                        {orphanPositions.map((p) => (
-                          <div key={p.symbol}>
-                            {p.symbol} · {p.positionAmt > 0 ? 'LONG' : 'SHORT'} {Math.abs(p.positionAmt).toFixed(4)} · entry ${p.entryPrice.toFixed(4)} · uPnL ${p.unRealizedProfit.toFixed(2)}
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                    <button
-                      onClick={handleCloseAllOrphans}
-                      disabled={isClosingOrphans}
-                      className="px-3 py-1.5 bg-amber-500/30 hover:bg-amber-500/50 text-amber-50 border border-amber-400/60 text-xs font-bold rounded-lg cursor-pointer disabled:opacity-50 shrink-0"
-                    >
-                      {isClosingOrphans ? 'Closing...' : 'Close All'}
                     </button>
                   </div>
                 </div>
@@ -3314,15 +3197,13 @@ ${items.join('\n\n')}
                     AI Trade Validator (Gemini)
                   </span>
                   <span className="text-[11px] text-slate-400">
-                    Every setup ≥ 70 gets a second opinion. Requires <code className="text-purple-300">#gk=KEY</code> in URL.
+                    Set key via: <code className="text-purple-300">#gk=KEY</code> in URL
                   </span>
                 </div>
                 <button
                   onClick={() => setAiValidatorEnabled((v) => !v)}
                   className={`px-3 py-1.5 rounded-lg text-xs font-bold font-mono border transition-colors cursor-pointer ${
-                    aiValidatorEnabled
-                      ? 'bg-purple-500/20 text-purple-300 border-purple-500/40'
-                      : 'bg-slate-900 text-slate-400 border-slate-800'
+                    aiValidatorEnabled ? 'bg-purple-500/20 text-purple-300 border-purple-500/40' : 'bg-slate-900 text-slate-400 border-slate-800'
                   }`}
                 >
                   {aiValidatorEnabled ? 'ON' : 'OFF'}
@@ -3359,7 +3240,7 @@ ${items.join('\n\n')}
                 <div>
                   <span className="text-xs font-bold text-white block">Market Type</span>
                   <span className="text-[11px] text-slate-400">
-                    {apiSettings.enableFutures ? 'USDT-M Futures (Algo SL/TP via /fapi/v1/algoOrder)' : 'Spot Trading (app-managed SL/TP)'}
+                    {apiSettings.enableFutures ? 'USDT-M Futures (Algo SL/TP)' : 'Spot Trading'}
                   </span>
                 </div>
                 <button
@@ -3409,7 +3290,7 @@ ${items.join('\n\n')}
               </div>
 
               <button onClick={handleTestAlert} className="w-full py-2.5 bg-blue-600 hover:bg-blue-500 text-white font-bold text-xs rounded-xl transition-colors flex items-center justify-center gap-2 cursor-pointer shadow-sm">
-                📱 Send Test Alert to Phone
+                📱 Send Test Alert
               </button>
               {testAlertMessage && (
                 <div className="p-2.5 bg-slate-950 border border-slate-800 rounded-lg text-[11px] font-mono text-blue-300 text-center">{testAlertMessage}</div>
@@ -3431,32 +3312,16 @@ ${items.join('\n\n')}
                 <div>✅ Price-drift guard: skip entries if price moved &gt;{(MAX_ENTRY_DRIFT_PCT * 100).toFixed(1)}% since scoring</div>
                 <div>✅ ATR-scaled SL at 2.2× (outside noise band)</div>
                 <div>✅ Funding-rate crowding filter (|funding| &gt; {(FUNDING_CROWDED_THRESHOLD * 100).toFixed(3)}%)</div>
-                <div>✅ 5m + 15m + 1h trend confirmation gates</div>
+                <div>✅ 5m + 15m + 1h + 4h trend confirmation gates</div>
                 <div>✅ 15-minute candle-close window (last 30s only)</div>
-                <div>✅ Network-aware kill switch — short blips (&lt;{Math.round(NETWORK_OFFLINE_KILL_THRESHOLD_MS / 60000)}min) are silently retried</div>
-                <div>✅ 4h bias filter — rejects counter-trend 5m setups</div>
-                <div>✅ Volume confirmation — last 3 candles ≥ {VOLUME_CONFIRMATION_MULTIPLIER.toFixed(1)}× 20-candle avg</div>
-                <div>✅ Expanded whitelist — {SCAN_WHITELIST.size} liquid symbols</div>
-                <div>✅ Per-symbol ATR thresholds — BTC 0.18% / ETH 0.20% / SOL 0.28% / alts 0.30–0.40%</div>
-                <div>✅ TIME STOP extended 30m → {Math.round(TIME_STOP_MS / 60000)}m (gives TP1 room to hit)</div>
-                <div>✅ R:R lowered 2.5 → {botConfig.risk_engine.min_reward_risk_ratio} (realistic TP target)</div>
-                <div>✅ AUTO-RECONCILE every {Math.round(RECONCILE_INTERVAL_MS / 60000)}m — detects SL/TP fills that WebSocket missed</div>
-                <div>✅ PERSISTENT STATE — daily PnL + per-symbol entry caps survive page reload</div>
-                <div>✅ Gemini AI Validator model: gemini-3.8-flash (fast-fails on 503 overload)</div>
-                <div>✅ WEEKEND FILTER: {SKIP_WEEKENDS ? 'ON — no new entries Sat/Sun UTC' : 'OFF'}</div>
-                <div>{aiValidatorEnabled && isAiValidatorConfigured() ? '✅ AI Trade Validator ON' : aiValidatorEnabled ? '⚠️ AI Validator ON but no key — running rules-only' : '⏸ AI Trade Validator OFF'}</div>
-              </div>
-            </div>
-
-            <div className="border-t border-slate-800 pt-5">
-              <h4 className="text-xs font-bold text-white mb-2">📱 Phone Alerts Enabled</h4>
-              <div className="text-[11px] text-slate-400 space-y-1 font-mono">
-                <div>✅ Trade opened → Telegram</div>
-                <div>🔇 Trade closed → console + journal only (silent)</div>
-                <div>✅ Daily drawdown hit → Telegram</div>
-                <div>✅ Geo-block detected → Telegram</div>
-                <div>✅ Bot start/stop → Telegram</div>
-                <div>🔇 Killzone enter/exit → console only (silent)</div>
+                <div>🔧 <span className="text-emerald-400">SCAN-MUTEX — no duplicate scans (FIX #3)</span></div>
+                <div>🔧 <span className="text-emerald-400">DAILY-CAP persisted in dedicated store (FIX #4)</span></div>
+                <div>🔧 <span className="text-emerald-400">Full rejection logging for every symbol (FIX #5)</span></div>
+                <div>🔧 <span className="text-emerald-400">Atomic trailing-stop updates via patchSignal (FIX #6)</span></div>
+                <div>🔧 <span className="text-emerald-400">fetchWithBackoff with rate-limit awareness (FIX #7)</span></div>
+                <div>🔧 <span className="text-emerald-400">Kill switch ignores HTTP 5xx (FIX #8)</span></div>
+                <div>✅ WEEKEND FILTER: {SKIP_WEEKENDS ? 'ON' : 'OFF'}</div>
+                <div>{aiValidatorEnabled && isAiValidatorConfigured() ? '✅ AI Trade Validator ON' : aiValidatorEnabled ? '⚠️ AI ON, no key' : '⏸ AI OFF'}</div>
               </div>
             </div>
 

@@ -313,7 +313,7 @@ async function callGeminiRest(
 
 export async function validateTradeWithAi(
   ctx: AiTradeContext,
-  timeoutMs: number = 6000,
+  timeoutMs: number = 8000,
 ): Promise<AiValidationResult | null> {
   const apiKey = getGeminiApiKey();
   if (!apiKey) {

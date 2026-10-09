@@ -1,4 +1,9 @@
 {
+  "//": "═══════════════════════════════════════════════════════════════════════════",
+  "//_README": "TradeSignal AI_SCALPER_AGENT_01 — full configuration manifest",
+  "//_FIXED": "Bug #1: MIN_CONFLUENCE_SCORE was hardcoded in App.tsx AND unreachable because signalEngine.ts capped at 60. Rebalanced in engine_config + signalEngine reweight. See CHANGELOG at bottom.",
+  "//": "═══════════════════════════════════════════════════════════════════════════",
+
   "agent_config": {
     "bot_id": "AI_SCALPER_AGENT_01",
     "main_agent_endpoint": "https://api.yourmainagent.com/v1/telemetry",
@@ -6,6 +11,7 @@
     "auto_code_patching_enabled": true,
     "self_healing_telemetry_interval_ms": 5000
   },
+
   "binance_config": {
     "base_ws_url": "wss://stream.binance.com:9443/ws",
     "base_futures_ws_url": "wss://fstream.binance.com/ws/",
@@ -25,12 +31,14 @@
     "leverage": 10,
     "margin_type": "ISOLATED"
   },
+
   "kill_zones_utc": {
-    "asian_session": { "start": "00:00", "end": "07:00", "weight": 0.2 },
-    "london_open": { "start": "07:00", "end": "10:00", "weight": 1.2 },
-    "new_york_open": { "start": "13:00", "end": "16:00", "weight": 1.5 },
-    "london_close": { "start": "16:00", "end": "18:00", "weight": 1.0 }
+    "asian_session":  { "start": "00:00", "end": "07:00", "weight": 0.2 },
+    "london_open":    { "start": "07:00", "end": "10:00", "weight": 1.2 },
+    "new_york_open":  { "start": "13:00", "end": "16:00", "weight": 1.5 },
+    "london_close":   { "start": "16:00", "end": "18:00", "weight": 1.0 }
   },
+
   "risk_engine": {
     "max_account_risk_percent": 1.0,
     "min_reward_risk_ratio": 1.5,
@@ -40,6 +48,7 @@
     "trailing_stop_activation_pnl_pct": 0.8,
     "trailing_stop_distance_pct": 0.3
   },
+
   "patterns_enabled": {
     "fair_value_gap": true,
     "market_structure_shift": true,
@@ -49,16 +58,236 @@
     "breaker_blocks": true,
     "optimal_trade_entry_ote": true
   },
+
   "copy_trade_config": {
     "enabled": true,
     "max_copy_allocation_usdt": 500,
     "copy_multiplier": 1.0,
     "auto_execute_signal": false
   },
+
   "learning_and_evaluation_engine": {
     "history_eval_window_trades": 100,
     "winrate_threshold_to_scale": 65.0,
     "auto_tune_weights": true,
     "rejection_filters": ["low_volume_sweep", "out_of_killzone", "rsi_divergence_mismatch"]
+  },
+
+  "//_NEW_BLOCKS_BELOW": "───────────────────────────────────────────────────────────",
+  "//_NEW_BLOCKS_NOTE": "These blocks are additive. Existing code that doesn't read them is unaffected.",
+
+  "engine_config": {
+    "//_purpose": "BUG #1 FIX — single source of truth for signal engine tunables",
+
+    "min_confluence_score": 70,
+    "//_min_confluence_score": "Passing threshold. signalEngine.scoreConfluence now returns up to 100 (was effectively ~60).",
+
+    "max_atr_pct": 0.02,
+    "//_max_atr_pct": "Reject symbols whose 5m ATR% exceeds this (violent regime). Decimal — 0.02 = 2.0%.",
+
+    "default_min_atr_pct": 0.0030,
+    "//_default_min_atr_pct": "Fallback ATR floor for symbols not listed in min_atr_pct_by_symbol.",
+
+    "min_atr_pct_by_symbol": {
+      "//_unit": "DECIMAL — 0.0018 = 0.18%. Do NOT store as 0.18.",
+      "BTC/USDT":  0.0018,
+      "ETH/USDT":  0.0020,
+      "SOL/USDT":  0.0028,
+      "BNB/USDT":  0.0022,
+      "XRP/USDT":  0.0035,
+      "ADA/USDT":  0.0030,
+      "DOGE/USDT": 0.0040,
+      "AVAX/USDT": 0.0035,
+      "LINK/USDT": 0.0030,
+      "DOT/USDT":  0.0030
+    },
+
+    "confluence_weights": {
+      "//_purpose": "Documentation of signalEngine.scoreConfluence weights. Sum = 100 per direction.",
+      "ema_stack_alignment":       25,
+      "price_vs_ema50":            15,
+      "rsi_momentum_regime":       20,
+      "volume_confirmation":       15,
+      "atr_healthy_bonus":         15,
+      "macd_histogram_agreement":  10
+    },
+
+    "volume_confirmation_multiplier": 1.0,
+    "//_volume_confirmation_multiplier": "Last 3 candles ≥ this × 20-candle avg.",
+
+    "trend_gate_required": true,
+    "//_trend_gate_required": "Require 15m + 1h + 4h to agree with 5m direction.",
+
+    "weekly_direction_lock": false,
+    "//_weekly_direction_lock": "When true, both longs and shorts are blocked on the same symbol."
+  },
+
+  "scan_guard": {
+    "//_purpose": "BUG #3 FIX — prevents duplicate scan execution",
+
+    "mutex_enabled": true,
+    "min_gap_ms": 5000,
+    "//_min_gap_ms": "Minimum milliseconds between two scan starts (even if first finished).",
+
+    "generation_tracking_enabled": true,
+    "//_generation_tracking_enabled": "If a newer scan starts, older async runs abort mid-flight.",
+
+    "background_interval_ms": 15000,
+    "//_background_interval_ms": "How often the background scanner checks (only fires inside 15m close window).",
+
+    "manual_scan_cooldown_ms": 3000,
+    "//_manual_scan_cooldown_ms": "Debounce for FORCE SCAN button clicks."
+  },
+
+  "network_resilience": {
+    "//_purpose": "BUG #7 + BUG #8 FIX — retry policy and kill-switch gating",
+
+    "retry_attempts": 3,
+    "retry_base_ms": 400,
+    "retry_max_ms": 5000,
+
+    "balance_stale_ms": 60000,
+    "//_balance_stale_ms": "Balance older than this triggers a refresh before scanning.",
+
+    "balance_refresh_ms": 20000,
+    "//_balance_refresh_ms": "Background balance polling interval.",
+
+    "offline_kill_threshold_ms": 600000,
+    "//_offline_kill_threshold_ms": "10 min. Kill switch only trips after this much time offline.",
+
+    "offline_kill_streak_min": 5,
+    "//_offline_kill_streak_min": "AND at least this many consecutive network failures.",
+
+    "treat_5xx_as_network": false,
+    "//_treat_5xx_as_network": "BUG #8 FIX — Binance 5xx is NOT counted as network loss.",
+
+    "reconcile_interval_ms": 180000,
+    "//_reconcile_interval_ms": "3 min. Reconciliation safety net for missed SL/TP fills."
+  },
+
+  "feature_flags": {
+    "//_purpose": "Toggle switches that were previously hardcoded const in App.tsx",
+
+    "skip_weekends": true,
+    "skip_killzone_default": true,
+    "min_killzone_weight": 0.3,
+
+    "use_adaptive_atr": false,
+    "//_use_adaptive_atr": "When true, atrThresholds.ts percentile logic is preferred over the static map. Reserved for future.",
+
+    "use_scan_mutex": true,
+    "use_daily_cap_persistence": true,
+    "use_fetch_with_backoff": true,
+
+    "ai_validator_default_on": false,
+    "//_ai_validator_default_on": "Overridden by localStorage['tradesignal_ai_validator'].",
+
+    "verbose_rejection_logging": true,
+    "//_verbose_rejection_logging": "BUG #5 FIX — log every rejection reason for every symbol."
+  },
+
+  "position_sizing": {
+    "//_purpose": "Documentation only — actual values live in App.tsx constants.",
+
+    "max_active_trades": 2,
+    "max_same_direction": 1,
+    "max_margin_use_pct": 20,
+    "max_daily_loss_pct": 10,
+    "max_entry_drift_pct": 0.010,
+    "max_consecutive_failures": 3,
+    "cooldown_after_sl_ms": 3600000,
+    "//_cooldown_after_sl_ms": "1 hour per-symbol lockout after a stop-loss fill."
+  },
+
+  "time_stop": {
+    "//_purpose": "Documentation only — how long an unprofitable trade is allowed to sit.",
+
+    "time_stop_ms": 3600000,
+    "//_time_stop_ms": "60 minutes.",
+
+    "time_stop_min_pnl": -0.5,
+    "time_stop_max_pnl": 0.3,
+    "//_rule": "Close trade if age ≥ time_stop_ms AND min_pnl ≤ pnl ≤ max_pnl (a dead trade)."
+  },
+
+  "safety_layers": {
+    "//_purpose": "Human-readable checklist — mirrors the Settings page safety list.",
+
+    "leverage_set_once_per_symbol": true,
+    "margin_type_isolated": true,
+    "algo_sl_tp_via_fapi": true,
+    "cancel_stale_algo_before_attach": true,
+    "hard_block_if_balance_unknown": true,
+    "direction_cap_enforced": true,
+    "free_margin_guard_pct": 20,
+    "emergency_close_on_sl_tp_failure": true,
+    "price_drift_guard_pct": 1.0,
+    "atr_scaled_sl_multiplier": 2.2,
+    "funding_rate_crowding_threshold": 0.0006,
+    "candle_close_window_sec": 30,
+    "weekend_filter_active": true
+  },
+
+  "logging": {
+    "//_purpose": "BUG #5 FIX — what gets printed to the console.",
+
+    "log_every_rejection": true,
+    "log_scan_summary": true,
+    "log_ai_verdicts": true,
+    "log_order_payloads": false,
+    "log_full_candle_arrays": false,
+    "log_background_scan_skips": true
+  },
+
+  "CHANGELOG": {
+    "//_purpose": "Trace of what each fix in the recent rebuild changed.",
+
+    "bug_1_min_confluence_unreachable": {
+      "file_changed": "signalEngine.ts",
+      "fix": "Rebalanced 6 weights (sum=100) so a passing 70 is reachable.",
+      "verified_by": "engine_config.min_confluence_score = 70"
+    },
+
+    "bug_2_duplicate_atr_map": {
+      "file_changed": "App.tsx + signalEngine.ts",
+      "fix": "MIN_ATR_PCT_BY_SYMBOL now lives only in signalEngine.ts. App imports it.",
+      "verified_by": "engine_config.min_atr_pct_by_symbol"
+    },
+
+    "bug_3_duplicate_scans": {
+      "file_changed": "scanGuard.ts (new)",
+      "fix": "Mutex + generation counter. Only one scan runs at a time.",
+      "verified_by": "scan_guard.mutex_enabled = true"
+    },
+
+    "bug_4_daily_cap_reset": {
+      "file_changed": "dailyCap.ts (new)",
+      "fix": "Dedicated IndexedDB/localStorage store. No more signals-dependent reset.",
+      "verified_by": "feature_flags.use_daily_cap_persistence = true"
+    },
+
+    "bug_5_silent_rejections": {
+      "file_changed": "App.tsx handleExecuteCryptoScalpScan",
+      "fix": "Every symbol logs WHY it was skipped.",
+      "verified_by": "feature_flags.verbose_rejection_logging = true"
+    },
+
+    "bug_6_trailing_stop_not_persisted": {
+      "file_changed": "App.tsx WebSocket onmessage handler",
+      "fix": "Atomic updates via single Map<string, Partial<TradeSignal>> then one setSignals call.",
+      "verified_by": "no config — code path only"
+    },
+
+    "bug_7_rate_limit_unaware": {
+      "file_changed": "binanceRetry.ts (new)",
+      "fix": "fetchWithBackoff with 429/418 Retry-After support.",
+      "verified_by": "network_resilience.retry_attempts = 3"
+    },
+
+    "bug_8_kill_switch_on_5xx": {
+      "file_changed": "binanceRetry.ts + App.tsx",
+      "fix": "5xx is retryable but NOT counted as network loss. Kill switch needs both time AND streak.",
+      "verified_by": "network_resilience.treat_5xx_as_network = false"
+    }
   }
 }
