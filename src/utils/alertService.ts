@@ -1,69 +1,40 @@
 // src/utils/alertService.ts
-// ═══════════════════════════════════════════════════════════════════════════
-// SECURITY FIX:
-//   The hardcoded token in the original file was compromised (posted in chat).
-//   This version reads from Vite env vars, with a localStorage fallback so
-//   the app still works in the browser without a rebuild.
-//
-//   Add to your .env file:
-//     VITE_TELEGRAM_BOT_TOKEN=your_new_token_here
-//     VITE_TELEGRAM_CHAT_ID=your_chat_id_here
-// ═══════════════════════════════════════════════════════════════════════════
+// ============================================================================
+// Telegram alert service — plain text, URL-encoded, with diagnostics.
+// ============================================================================
 
-function getToken(): string {
-  try {
-    const env: any = (import.meta as any)?.env ?? {};
-    const fromEnv = env.VITE_TELEGRAM_BOT_TOKEN || '';
-    if (typeof fromEnv === 'string' && fromEnv.trim().length > 0) return fromEnv.trim();
-  } catch { /* ignore */ }
+// ⚠️ This token has been posted publicly in chat. It is compromised.
+//     Revoke it in @BotFather and replace this line before going live.
+const TELEGRAM_BOT_TOKEN = '8935995466:AAG7YU-j4SeoDj5oanSDEQ2nDKbnsS8NpfM';
 
-  try {
-    const ls = localStorage.getItem('tradesignal_tg_token');
-    if (ls && ls.trim().length > 0) return ls.trim();
-  } catch { /* ignore */ }
+// Your numeric chat_id, taken from your /getUpdates response.
+const TELEGRAM_CHAT_ID = '1034087034';
 
-  return '';
-}
+const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 
-function getChatId(): string {
-  try {
-    const env: any = (import.meta as any)?.env ?? {};
-    const fromEnv = env.VITE_TELEGRAM_CHAT_ID || '';
-    if (typeof fromEnv === 'string' && fromEnv.trim().length > 0) return fromEnv.trim();
-  } catch { /* ignore */ }
-
-  try {
-    const ls = localStorage.getItem('tradesignal_tg_chat_id');
-    if (ls && ls.trim().length > 0) return ls.trim();
-  } catch { /* ignore */ }
-
-  return '';
-}
-
-if (typeof window !== 'undefined') {
-  (window as any).setTelegramCreds = (token: string, chatId: string) => {
-    try { localStorage.setItem('tradesignal_tg_token', token); } catch { /* ignore */ }
-    try { localStorage.setItem('tradesignal_tg_chat_id', chatId); } catch { /* ignore */ }
-    console.log('%c✅ Telegram credentials saved. Reloading…', 'color:#00E676;font-weight:bold');
-    setTimeout(() => window.location.reload(), 800);
-  };
-}
-
+// ────────────────────────────────────────────────────────────────────────────
+// Low-level sender — plain text only, no parse_mode, always URL-encoded.
+// ────────────────────────────────────────────────────────────────────────────
 async function sendTelegram(text: string): Promise<boolean> {
-  const TOKEN = getToken();
-  const CHAT_ID = getChatId();
+  const tokenOk = typeof TELEGRAM_BOT_TOKEN === 'string' && TELEGRAM_BOT_TOKEN.trim().length > 0;
+  const chatOk  = typeof TELEGRAM_CHAT_ID   === 'string' && TELEGRAM_CHAT_ID.trim().length   > 0;
 
-  if (!TOKEN || !CHAT_ID) {
-    console.warn('[telegram] Not configured. Run: setTelegramCreds("token", "chatid")');
+  if (!tokenOk) {
+    console.warn('[telegram] Bot token not configured.');
+    return false;
+  }
+  if (!chatOk) {
+    console.warn('[telegram] chat_id not configured.');
     return false;
   }
 
   const safeText = text.length > 4000 ? text.slice(0, 3990) + '…' : text;
-  const url = `https://api.telegram.org/bot${TOKEN}/sendMessage?chat_id=${encodeURIComponent(CHAT_ID)}&text=${encodeURIComponent(safeText)}`;
+  const url = `${TELEGRAM_API}/sendMessage?chat_id=${encodeURIComponent(TELEGRAM_CHAT_ID)}&text=${encodeURIComponent(safeText)}`;
 
   try {
     const res = await fetch(url, { method: 'GET' });
     const body = await res.text();
+
     if (!res.ok) {
       console.error(`[telegram] HTTP ${res.status} body: ${body.slice(0, 400)}`);
       return false;
@@ -84,10 +55,15 @@ async function sendTelegram(text: string): Promise<boolean> {
   }
 }
 
-// ─── Public API (unchanged signatures — drop-in replacement) ───
-
+// ────────────────────────────────────────────────────────────────────────────
+// Public API — matches the functions imported in App.tsx
+// ────────────────────────────────────────────────────────────────────────────
 export async function alertTest(): Promise<boolean> {
-  return sendTelegram(`✅ TradeSignal Bot Test\nYour alerts are working.\nTime: ${new Date().toUTCString()}`);
+  return sendTelegram(
+    `✅ TradeSignal Bot Test\n` +
+    `Your alerts are working.\n` +
+    `Time: ${new Date().toUTCString()}`,
+  );
 }
 
 export async function alertTradeOpened(info: {
@@ -116,7 +92,7 @@ export async function alertTradeOpened(info: {
 
 export async function alertTradeClosed(info: {
   symbol: string; direction: string; entryPrice: number; exitPrice: number;
-  pnlPercentage: number; outcome: string;
+  pnlPercentage: number; outcome: 'SL' | 'TP1' | 'TP2' | 'MANUAL' | string;
   duration: string; environment: string;
 }): Promise<boolean> {
   const emoji = info.outcome === 'SL' ? '🔴' : info.outcome === 'MANUAL' ? '⚪' : '🟢';
@@ -133,21 +109,47 @@ export async function alertTradeClosed(info: {
 }
 
 export async function alertDailyDrawdownHit(pnlPct: number, environment: string): Promise<boolean> {
-  return sendTelegram(`🛑 DAILY DRAWDOWN LIMIT HIT\nDaily P&L: ${pnlPct.toFixed(2)}%\nTrading paused for today.\nEnv: ${environment}`);
+  return sendTelegram(
+    `🛑 DAILY DRAWDOWN LIMIT HIT\n` +
+    `Daily P&L: ${pnlPct.toFixed(2)}%\n` +
+    `Trading paused for today.\n` +
+    `Env: ${environment}`,
+  );
 }
 
 export async function alertGeoBlock(reason: string, environment: string): Promise<boolean> {
-  return sendTelegram(`🚫 GEO BLOCK DETECTED\nReason: ${reason}\nEnv: ${environment}`);
+  return sendTelegram(
+    `🚫 GEO BLOCK DETECTED\n` +
+    `Reason: ${reason}\n` +
+    `Env: ${environment}`,
+  );
 }
 
 export async function alertBotStarted(environment: string, pairs: number, minScore: number): Promise<boolean> {
-  return sendTelegram(`🤖 BOT STARTED\nEnv: ${environment}\nPairs: ${pairs}\nMin confluence: ${minScore}\nTime: ${new Date().toUTCString()}`);
+  return sendTelegram(
+    `🤖 BOT STARTED\n` +
+    `Env: ${environment}\n` +
+    `Pairs: ${pairs}\n` +
+    `Min confluence: ${minScore}\n` +
+    `Time: ${new Date().toUTCString()}`,
+  );
 }
 
 export async function alertBotStopped(environment: string): Promise<boolean> {
-  return sendTelegram(`⏸️ BOT STOPPED\nEnv: ${environment}\nTime: ${new Date().toUTCString()}`);
+  return sendTelegram(
+    `⏸️ BOT STOPPED\n` +
+    `Env: ${environment}\n` +
+    `Time: ${new Date().toUTCString()}`,
+  );
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// NEW — Killzone transition alerts
+//
+// Fires when the active killzone changes (enter a new zone, or exit all
+// zones). Driven by the watcher effect in App.tsx that polls
+// getActiveKillZoneInfo() every 30 seconds.
+// ═══════════════════════════════════════════════════════════════════════════
 export async function alertKillZoneChange(
   event: 'ENTER' | 'EXIT',
   zoneName: string,
@@ -156,7 +158,8 @@ export async function alertKillZoneChange(
   env: string,
 ): Promise<boolean> {
   const emoji = event === 'ENTER' ? '🟢' : '🔴';
-  const verb = event === 'ENTER' ? 'ENTERED' : 'EXITED';
+  const verb  = event === 'ENTER' ? 'ENTERED' : 'EXITED';
+
   return sendTelegram(
     `${emoji} KILLZONE ${verb}\n` +
     `Zone: ${zoneName}\n` +
