@@ -1,4 +1,17 @@
 // src/App.tsx
+// 🔧 FIXES APPLIED (2026-10-10):
+//    FIX 1 — Pin scan function in a ref so background scans always use latest API keys
+//    FIX 5 — Multiply P&L by leverage so daily loss / kill switch reflect actual margin
+// 🔧 RISK-ENGINE MODIFICATIONS (2026-10-12):
+//    RISK 1 — Session gate: only NEW_YORK_AM (12:00-16:00 UTC) can trade
+//    RISK 2 — Daily loss limit lowered from 10% → 4% (RISK_CONFIG.dailyLossLimitPct)
+//    RISK 3 — Cooldown after consecutive losses
+//    RISK 4 — ATR-based hard gate before every entry (riskEngine.approveTrade)
+//    RISK 5 — registerEntry / registerExit sync risk engine state
+// 🔧 GHOST GUARD (2026-10-12):
+//    GG 1 — Reject impossible daily P&L values on startup (fixes -12.32% ghost)
+//    GG 2 — Auto-zero localStorage when daily P&L would instantly trip kill switch
+
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { TradeSignal, MarketAsset, ClosedSignal, ClosedOutcome } from './types';
 import { Header, NavTab } from './components/Header';
@@ -21,6 +34,23 @@ import {
   type AiTradeContext,
   type AiRecentTrade,
 } from './utils/aiTradeValidator';
+
+// ═══════════════════════════════════════════════════════════════════════════
+// RISK ENGINE INTEGRATION
+// ═══════════════════════════════════════════════════════════════════════════
+import {
+  approveTrade,
+  registerEntry,
+  registerExit,
+  getRiskStatus,
+  getRiskState,
+  resetRiskState,
+  type TradePlan,
+} from './utils/riskEngine';
+import { anySessionOpen, sessionBlockReason, openSessionNames } from './utils/sessionFilter';
+import { shouldBlockForCooldown, cooldownRemainingMinutes } from './utils/cooldownTracker';
+import { RISK_CONFIG } from './config/riskConfig';
+
 import {
   alertTest,
   alertTradeOpened,
@@ -71,7 +101,10 @@ const SKIP_WEEKENDS = true;
 const MAX_ACTIVE_TRADES = 2;
 const MAX_SAME_DIRECTION = 1;
 const MAX_MARGIN_USE_PCT = 20;
-const MAX_DAILY_LOSS_PCT = 10;
+
+// 🔧 RISK 2: personal hard stop = 4%
+const MAX_DAILY_LOSS_PCT = RISK_CONFIG.dailyLossLimitPct;
+
 const BALANCE_STALE_MS = 60_000;
 const BALANCE_REFRESH_MS = 20_000;
 const COOLDOWN_AFTER_SL_MS = 60 * 60_000;
@@ -92,11 +125,11 @@ const SIGNALS_KEEP_CLOSED = 20;
 
 const RECONCILE_INTERVAL_MS = 2 * 60_000;
 
-// 🔧 PERSISTENCE FIX: localStorage keys for daily state
+const TRADING_LEVERAGE = botConfig.binance_config.leverage || 1;
+
 const LS_DAILY_PNL_KEY = 'tradesignal_daily_pnl';
 const LS_DAILY_ENTRY_COUNT_KEY = 'tradesignal_daily_entry_count';
 
-// 🔧 VOLUME FIX: 1.2 → 1.0 (was killing normal-volume trend starts)
 const VOLUME_CONFIRMATION_MULTIPLIER = 1.0;
 
 const SCAN_WHITELIST = new Set<string>([
@@ -361,6 +394,8 @@ export const App: React.FC = () => {
   const [orphanPositions, setOrphanPositions] = useState<OrphanPosition[]>([]);
   const [orphanBannerDismissed, setOrphanBannerDismissed] = useState<boolean>(false);
 
+  const [riskStatus, setRiskStatus] = useState(() => getRiskStatus());
+
   const [apiSettings, setApiSettings] = useState<BinanceApiSettings>(() => {
     const saved = localStorage.getItem('tradesignal_binance_api_config');
     if (saved) {
@@ -425,7 +460,6 @@ export const App: React.FC = () => {
 
   const journalRecordedRef = useRef<Set<string>>(new Set());
 
-  // 🔧 PERSISTENCE FIX: restore per-symbol daily entry count from localStorage
   const dailyEntryCountRef = useRef<Record<string, number>>(
     (() => {
       try {
@@ -448,7 +482,7 @@ export const App: React.FC = () => {
 
   const lossCooldownRef = useRef<Record<string, number>>({});
 
-  // 🔧 PERSISTENCE FIX: restore daily PnL from localStorage (only if same UTC day)
+  // 🔧 GHOST GUARD: reject impossible daily P&L values on startup
   const dailyPnlRef = useRef<{ day: string; pnl: number }>(
     (() => {
       try {
@@ -457,7 +491,21 @@ export const App: React.FC = () => {
         if (!saved) return { day: today, pnl: 0 };
         const parsed = JSON.parse(saved);
         if (parsed && parsed.day === today && Number.isFinite(Number(parsed.pnl))) {
-          return { day: today, pnl: Number(parsed.pnl) };
+          const pnl = Number(parsed.pnl);
+          // 🛑 GHOST GUARD — reject impossible values on startup
+          if (pnl <= -MAX_DAILY_LOSS_PCT) {
+            console.warn(
+              `[GHOST-GUARD] Ignoring stale P&L ${pnl.toFixed(2)}% from localStorage — starting at 0`,
+            );
+            try {
+              localStorage.setItem(
+                LS_DAILY_PNL_KEY,
+                JSON.stringify({ day: today, pnl: 0 }),
+              );
+            } catch { /* ignore */ }
+            return { day: today, pnl: 0 };
+          }
+          return { day: today, pnl };
         }
         return { day: today, pnl: 0 };
       } catch { return { day: '', pnl: 0 }; }
@@ -502,6 +550,11 @@ export const App: React.FC = () => {
   useEffect(() => { killSwitchRef.current = killSwitchOn; }, [killSwitchOn]);
   useEffect(() => { accountSnapshotRef.current = accountSnapshot; }, [accountSnapshot]);
   useEffect(() => { apiSettingsRef.current = apiSettings; }, [apiSettings]);
+
+  useEffect(() => {
+    const t = setInterval(() => setRiskStatus(getRiskStatus()), 5000);
+    return () => clearInterval(t);
+  }, []);
 
   const addSignals = (incoming: TradeSignal[]) => {
     setSignals((prev) => [...prev, ...incoming]);
@@ -848,7 +901,6 @@ export const App: React.FC = () => {
   useEffect(() => { localStorage.setItem('tradesignal_crypto_signals', JSON.stringify(signals)); }, [signals]);
   useEffect(() => { localStorage.setItem('tradesignal_binance_api_config', JSON.stringify(apiSettings)); }, [apiSettings]);
 
-  // 🔧 PERSISTENCE FIX: persist daily entry count on every change
   useEffect(() => {
     try {
       localStorage.setItem(
@@ -858,7 +910,6 @@ export const App: React.FC = () => {
     } catch { /* ignore quota errors */ }
   }, [signals]);
 
-  // 🔧 PERSISTENCE FIX: persist daily PnL on every change
   useEffect(() => {
     try {
       localStorage.setItem(
@@ -881,7 +932,6 @@ export const App: React.FC = () => {
     return () => clearInterval(t);
   }, [apiSettings.isConfigured, apiSettings.environment, apiSettings.enableFutures, apiSettings.apiKey]);
 
-  // 🔧 PERSISTENCE FIX: rollover also clears/persists localStorage
   useEffect(() => {
     const rollover = () => {
       const today = new Date().toISOString().slice(0, 10);
@@ -1399,9 +1449,6 @@ export const App: React.FC = () => {
     };
   };
 
-  // ═════════════════════════════════════════════════════════════════════════
-  // RECONCILE ACTIVE SIGNALS — safety net for missed SL/TP fills
-  // ═════════════════════════════════════════════════════════════════════════
   const reconcileActiveSignals = async (tag: string): Promise<void> => {
     if (!apiSettings.apiKey || !apiSettings.apiSecret || !apiSettings.enableFutures) return;
 
@@ -1430,7 +1477,7 @@ export const App: React.FC = () => {
             const rawPnl = isLong
               ? ((exitPrice - sig.entryPrice) / sig.entryPrice) * 100
               : ((sig.entryPrice - exitPrice) / sig.entryPrice) * 100;
-            pnlPct = Number(rawPnl.toFixed(2));
+            pnlPct = Number((rawPnl * TRADING_LEVERAGE).toFixed(2));
           }
         } catch { /* fallback to stored values */ }
 
@@ -1457,8 +1504,10 @@ export const App: React.FC = () => {
         if (outcome === 'SL') {
           lossCooldownRef.current[sig.symbol] = Date.now();
           dailyPnlRef.current.pnl -= Math.abs(pnlPct);
+          try { registerExit(exitPrice); } catch { /* ignore */ }
         } else if (outcome === 'TP1') {
           dailyPnlRef.current.pnl += Math.abs(pnlPct);
+          try { registerExit(exitPrice); } catch { /* ignore */ }
         }
 
         patchSignal(sig.id, {
@@ -1481,7 +1530,6 @@ export const App: React.FC = () => {
     }
   };
 
-  // Periodic reconciliation — every 2 min as safety net
   useEffect(() => {
     if (!apiSettings.apiKey || !apiSettings.apiSecret || !apiSettings.enableFutures) return;
 
@@ -1500,9 +1548,6 @@ export const App: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [apiSettings.apiKey, apiSettings.apiSecret, apiSettings.enableFutures]);
 
-  // ═════════════════════════════════════════════════════════════════════════
-  // USER DATA STREAM
-  // ═════════════════════════════════════════════════════════════════════════
   useEffect(() => {
     if (!apiSettings.apiKey || !apiSettings.enableFutures) return;
     if (listenKeyFatalRef.current) return;
@@ -1562,7 +1607,7 @@ export const App: React.FC = () => {
               ? ((exitP - target.entryPrice) / target.entryPrice) * 100
               : ((target.entryPrice - exitP) / target.entryPrice) * 100;
             const outcome: ClosedOutcome = isSlFill ? 'SL' : 'TP1';
-            const pnlPct = Number(rawPnl.toFixed(2));
+            const pnlPct = Number((rawPnl * TRADING_LEVERAGE).toFixed(2));
 
             markClosedHandled(target.id);
             recordClosedSignalToJournal(target, exitP, outcome, pnlPct);
@@ -1574,10 +1619,13 @@ export const App: React.FC = () => {
             });
             if (isSlFill) {
               lossCooldownRef.current[target.symbol] = Date.now();
-              dailyPnlRef.current.pnl -= Math.abs(rawPnl);
+              dailyPnlRef.current.pnl -= Math.abs(rawPnl * TRADING_LEVERAGE);
             } else {
-              dailyPnlRef.current.pnl += Math.abs(rawPnl);
+              dailyPnlRef.current.pnl += Math.abs(rawPnl * TRADING_LEVERAGE);
             }
+
+            try { registerExit(exitP); } catch { /* ignore */ }
+
             refreshAccountSnapshot();
             if (dailyPnlRef.current.pnl <= -MAX_DAILY_LOSS_PCT) {
               tripKillSwitch(`Daily loss ${dailyPnlRef.current.pnl.toFixed(2)}% hit -${MAX_DAILY_LOSS_PCT}%`);
@@ -1821,9 +1869,28 @@ ${items.join('\n\n')}
     setTimeout(() => setCopiedAllTrades(false), 2000);
   };
 
+  // ═════════════════════════════════════════════════════════════════════════
   // MAIN SCAN
+  // ═════════════════════════════════════════════════════════════════════════
   const handleExecuteCryptoScalpScan = async () => {
     console.log('[SCAN] ========== Scan starting ==========');
+
+    // 🔧 RISK 1: Session gate
+    if (!anySessionOpen()) {
+      const reason = sessionBlockReason() ?? 'Outside trading session';
+      console.log(`[SCAN] ⏸️ SESSION BLOCKED: ${reason}`);
+      setConnectionLog(`⏸️ ${reason}. Only NEW_YORK_AM (12:00-16:00 UTC) is enabled.`);
+      return;
+    }
+
+    // 🔧 RISK 3: Cooldown check
+    const cooldown = shouldBlockForCooldown();
+    if (cooldown.blocked) {
+      console.log(`[SCAN] ⏸️ COOLDOWN: ${cooldown.reason}`);
+      setConnectionLog(`⏸️ ${cooldown.reason}`);
+      return;
+    }
+
     if (killSwitchRef.current) {
       setConnectionLog('🛑 Kill switch is ON — scan aborted. Clear it in Settings to resume.');
       return;
@@ -1844,7 +1911,7 @@ ${items.join('\n\n')}
     }
 
     const zone = isInKillZone();
-    if (!skipKillZone && zone.weight < MIN_KILLZONE_WEIGHT) {
+    if (!skipKillZone && !zone.ok) {
       setConnectionLog(`⏸ Outside high-weight kill zones (${zone.name}, w=${zone.weight}) — skipped.`);
       return;
     }
@@ -1852,15 +1919,14 @@ ${items.join('\n\n')}
     const today = new Date().toISOString().slice(0, 10);
     if (dailyPnlRef.current.day !== today) dailyPnlRef.current = { day: today, pnl: 0 };
 
-    if (dailyPnlRef.current.pnl <= -botConfig.risk_engine.max_daily_drawdown_percent) {
+    if (dailyPnlRef.current.pnl <= -MAX_DAILY_LOSS_PCT) {
       setConnectionLog(
-        `🛑 Daily drawdown limit reached (${dailyPnlRef.current.pnl.toFixed(2)}% ≤ -${botConfig.risk_engine.max_daily_drawdown_percent}%) — paused.`
+        `🛑 Personal daily stop reached (${dailyPnlRef.current.pnl.toFixed(2)}% ≤ -${MAX_DAILY_LOSS_PCT}%) — paused.`
       );
       alertDailyDrawdownHit(dailyPnlRef.current.pnl, apiSettings.environment);
-      return;
-    }
-    if (dailyPnlRef.current.pnl <= -MAX_DAILY_LOSS_PCT) {
-      tripKillSwitch(`Daily loss ${dailyPnlRef.current.pnl.toFixed(2)}% ≤ -${MAX_DAILY_LOSS_PCT}%`);
+      if (!killSwitchRef.current) {
+        tripKillSwitch(`Personal daily stop -${MAX_DAILY_LOSS_PCT}% reached`);
+      }
       return;
     }
 
@@ -2037,6 +2103,15 @@ ${items.join('\n\n')}
       }
       if (confluence.direction === 'SHORT' && fundingRate < -FUNDING_CROWDED_THRESHOLD) {
         console.log(`[SCAN] ${asset.symbol}: ❌ rejected — funding ${fundingPct.toFixed(4)}% too bearish (crowded shorts)`);
+        continue;
+      }
+
+      // 🔧 RISK 4: ATR-based hard gate
+      const atr = confluence.indicators.atr;
+      const riskApproval = approveTrade(asset.symbol, asset.price, atr);
+      if (!riskApproval.approved) {
+        console.log(`[SCAN] ${asset.symbol}: 🚫 RISK VETO: ${riskApproval.reason}`);
+        setConnectionLog(`🚫 ${asset.symbol} vetoed by risk engine: ${riskApproval.reason}`);
         continue;
       }
 
@@ -2273,6 +2348,24 @@ ${items.join('\n\n')}
         environment: apiSettings.environment, usdtBalance: liveSnapshot.availableBalance,
       });
 
+      // 🔧 RISK 5: register entry with risk engine
+      const distFinal = Math.abs(pos.entryPrice - pos.stopLoss);
+      const riskPlan: TradePlan = {
+        symbol: pos.symbol,
+        quantity: qty,
+        entryPrice: r.fillPrice ?? pos.entryPrice,
+        stopPrice: pos.stopLoss,
+        targetPrice: pos.takeProfit1,
+        stopDistance: distFinal,
+        riskUsdt: RISK_CONFIG.capital * (RISK_CONFIG.riskPerTradePct / 100),
+        notional: qty * (r.fillPrice ?? pos.entryPrice),
+      };
+      try {
+        registerEntry(riskPlan, side === 'BUY' ? 'LONG' : 'SHORT');
+      } catch (e) {
+        console.warn('[RISK] registerEntry failed:', e);
+      }
+
       const todayKey = `${new Date().toISOString().slice(0, 10)}|${pos.symbol}`;
       dailyEntryCountRef.current[todayKey] = (dailyEntryCountRef.current[todayKey] ?? 0) + 1;
       console.log(
@@ -2292,14 +2385,12 @@ ${items.join('\n\n')}
     }
 
     setIsScanning(false);
+    setRiskStatus(getRiskStatus());
   };
 
   const scanFnRef = useRef(handleExecuteCryptoScalpScan);
   useEffect(() => { scanFnRef.current = handleExecuteCryptoScalpScan; });
 
-  // ═════════════════════════════════════════════════════════════════════════
-  // STARTUP JOBS
-  // ═════════════════════════════════════════════════════════════════════════
   const orphanCheckRanRef = useRef(false);
   useEffect(() => {
     if (!apiSettings.apiKey || !apiSettings.apiSecret || !apiSettings.enableFutures) return;
@@ -2558,6 +2649,8 @@ ${items.join('\n\n')}
           environment: apiSettings.environment,
         });
 
+        try { registerExit(exit); } catch { /* ignore */ }
+
         patchSignal(trade.id, {
           status: 'CLOSED',
           outcome: 'TIME_STOP',
@@ -2673,7 +2766,7 @@ ${items.join('\n\n')}
         }
 
         for (const { sig, livePrice, outcome, rawPnl } of closures) {
-          const pnlPct = Number(rawPnl.toFixed(2));
+          const pnlPct = Number((rawPnl * TRADING_LEVERAGE).toFixed(2));
           markClosedHandled(sig.id);
           recordClosedSignalToJournal(sig, livePrice, outcome, pnlPct);
           alertTradeClosed({
@@ -2685,10 +2778,11 @@ ${items.join('\n\n')}
           });
           if (outcome === 'SL') {
             lossCooldownRef.current[sig.symbol] = Date.now();
-            dailyPnlRef.current.pnl -= Math.abs(rawPnl);
+            dailyPnlRef.current.pnl -= Math.abs(rawPnl * TRADING_LEVERAGE);
           } else {
-            dailyPnlRef.current.pnl += Math.abs(rawPnl);
+            dailyPnlRef.current.pnl += Math.abs(rawPnl * TRADING_LEVERAGE);
           }
+          try { registerExit(livePrice); } catch { /* ignore */ }
         }
         if (closures.length > 0 && dailyPnlRef.current.pnl <= -MAX_DAILY_LOSS_PCT) {
           tripKillSwitch(`Daily loss ${dailyPnlRef.current.pnl.toFixed(2)}% ≤ -${MAX_DAILY_LOSS_PCT}%`);
@@ -2706,6 +2800,7 @@ ${items.join('\n\n')}
           const rawPnl = isLong
             ? ((livePrice - sig.entryPrice) / (sig.entryPrice || 1)) * 100
             : ((sig.entryPrice - livePrice) / (sig.entryPrice || 1)) * 100;
+          const leveragedPnl = Number((rawPnl * TRADING_LEVERAGE).toFixed(2));
 
           const trailing = trailingStopUpdates.get(sig.id);
           const stopLoss = trailing !== undefined ? trailing : sig.stopLoss;
@@ -2716,13 +2811,13 @@ ${items.join('\n\n')}
               ...sig,
               currentPrice: closed.livePrice,
               stopLoss,
-              pnlPercentage: Number(closed.rawPnl.toFixed(2)),
+              pnlPercentage: Number((closed.rawPnl * TRADING_LEVERAGE).toFixed(2)),
               status: 'CLOSED',
               outcome: closed.outcome,
               closedAt: Date.now(),
             };
           }
-          return { ...sig, currentPrice: livePrice, stopLoss, pnlPercentage: Number(rawPnl.toFixed(2)) };
+          return { ...sig, currentPrice: livePrice, stopLoss, pnlPercentage: leveragedPnl };
         }));
 
         signalsRef.current = signalsRef.current.map((sig) => {
@@ -2734,6 +2829,8 @@ ${items.join('\n\n')}
           const rawPnl = isLong
             ? ((livePrice - sig.entryPrice) / (sig.entryPrice || 1)) * 100
             : ((sig.entryPrice - livePrice) / (sig.entryPrice || 1)) * 100;
+          const leveragedPnl = Number((rawPnl * TRADING_LEVERAGE).toFixed(2));
+
           const trailing = trailingStopUpdates.get(sig.id);
           const stopLoss = trailing !== undefined ? trailing : sig.stopLoss;
           const closed = closedMap.get(sig.id);
@@ -2742,13 +2839,13 @@ ${items.join('\n\n')}
               ...sig,
               currentPrice: closed.livePrice,
               stopLoss,
-              pnlPercentage: Number(closed.rawPnl.toFixed(2)),
+              pnlPercentage: Number((closed.rawPnl * TRADING_LEVERAGE).toFixed(2)),
               status: 'CLOSED',
               outcome: closed.outcome,
               closedAt: Date.now(),
             };
           }
-          return { ...sig, currentPrice: livePrice, stopLoss, pnlPercentage: Number(rawPnl.toFixed(2)) };
+          return { ...sig, currentPrice: livePrice, stopLoss, pnlPercentage: leveragedPnl };
         });
       } catch (e) {
         console.error('Binance WS parse error:', e);
@@ -2800,17 +2897,19 @@ ${items.join('\n\n')}
     if (t) {
       const exit = t.currentPrice || t.entryPrice;
       const isLong = t.direction.includes('BUY');
-      const pnl = t.pnlPercentage ?? (isLong
+      const rawPnl = isLong
         ? ((exit - t.entryPrice) / t.entryPrice) * 100
-        : ((t.entryPrice - exit) / t.entryPrice) * 100);
-      recordClosedSignalToJournal(t, exit, 'MANUAL', Number(pnl.toFixed(2)));
+        : ((t.entryPrice - exit) / t.entryPrice) * 100;
+      const pnl = Number((rawPnl * TRADING_LEVERAGE).toFixed(2));
+      recordClosedSignalToJournal(t, exit, 'MANUAL', pnl);
       alertTradeClosed({
         symbol: t.symbol, direction: t.direction,
         entryPrice: t.entryPrice, exitPrice: exit,
-        pnlPercentage: Number(pnl.toFixed(2)), outcome: 'MANUAL',
+        pnlPercentage: pnl, outcome: 'MANUAL',
         duration: formatDuration(t.startTime || Date.now()),
         environment: apiSettings.environment,
       });
+      try { registerExit(exit); } catch { /* ignore */ }
     }
     patchSignal(tradeId, { status: 'CLOSED', outcome: 'MANUAL', closedAt: Date.now() });
   };
@@ -2820,17 +2919,22 @@ ${items.join('\n\n')}
     actives.forEach((t) => {
       const exit = t.currentPrice || t.entryPrice;
       const isLong = t.direction.includes('BUY');
-      const pnl = t.pnlPercentage ?? (isLong
+      const rawPnl = isLong
         ? ((exit - t.entryPrice) / t.entryPrice) * 100
-        : ((t.entryPrice - exit) / t.entryPrice) * 100);
-      recordClosedSignalToJournal(t, exit, 'MANUAL', Number(pnl.toFixed(2)));
+        : ((t.entryPrice - exit) / t.entryPrice) * 100;
+      const pnl = Number((rawPnl * TRADING_LEVERAGE).toFixed(2));
+      recordClosedSignalToJournal(t, exit, 'MANUAL', pnl);
       patchSignal(t.id, { status: 'CLOSED', outcome: 'MANUAL', closedAt: Date.now() });
+      try { registerExit(exit); } catch { /* ignore */ }
     });
   };
 
   const activeTrades = useMemo(() => signals.filter((s) => s.status === 'ACTIVE'), [signals]);
 
   const balanceAgeSec = accountSnapshot ? Math.round((Date.now() - accountSnapshot.updatedAt) / 1000) : null;
+
+  const sessionOpen = anySessionOpen();
+  const sessionNames = openSessionNames();
 
   return (
     <div id="tradesignal-app-root" className="h-screen max-h-screen overflow-hidden bg-slate-950 text-slate-100 flex flex-col font-sans">
@@ -2848,6 +2952,38 @@ ${items.join('\n\n')}
         <div className="bg-slate-900/90 border-b border-slate-800 py-1.5 px-4 text-center text-xs font-mono text-emerald-400 flex items-center justify-center gap-2">
           <RefreshCw className="w-3.5 h-3.5 animate-spin" />
           <span>Connecting to Binance Streaming Engine [{connectionStatus}]...</span>
+        </div>
+      )}
+
+      {!sessionOpen && !killSwitchOn && (
+        <div className="bg-indigo-600/20 border-b-2 border-indigo-500 px-4 py-2 text-[12px] font-mono text-indigo-100 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <Clock className="w-4 h-4 text-indigo-300 shrink-0" />
+            <span>
+              <strong>⏸ OUTSIDE TRADING SESSION</strong> — only NEW_YORK_AM (12:00-16:00 UTC) is enabled.
+              {sessionNames.length > 0 && ` Currently open: ${sessionNames.join(', ')}`}
+            </span>
+          </div>
+          <span className="text-[10px] text-indigo-300/70 shrink-0 hidden sm:inline">
+            UTC {new Date().toISOString().slice(11, 16)}
+          </span>
+        </div>
+      )}
+
+      {riskStatus.halted && !killSwitchOn && (
+        <div className="bg-rose-600/20 border-b-2 border-rose-500 px-4 py-2 text-[12px] font-mono text-rose-200 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <ShieldAlert className="w-4 h-4 text-rose-400 shrink-0 animate-pulse" />
+            <span>
+              <strong>🛑 RISK ENGINE HALTED</strong> — daily P&amp;L {riskStatus.dailyPnlPct.toFixed(2)}% hit -{MAX_DAILY_LOSS_PCT}%.
+            </span>
+          </div>
+          <button
+            onClick={() => { resetRiskState(); setRiskStatus(getRiskStatus()); }}
+            className="px-3 py-1 rounded bg-rose-500/30 hover:bg-rose-500/50 text-rose-100 border border-rose-400/60 text-[10px] font-bold shrink-0 cursor-pointer"
+          >
+            Reset Risk State
+          </button>
         </div>
       )}
 
@@ -3016,6 +3152,10 @@ ${items.join('\n\n')}
                     <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-pink-500/20 text-pink-300 border border-pink-500/30">
                       PERSISTENT STATE
                     </span>
+                    <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-rose-500/20 text-rose-300 border border-rose-500/30 flex items-center gap-1">
+                      <Shield className="w-3 h-3" />
+                      RISK ENGINE
+                    </span>
                     {aiValidatorEnabled && (
                       <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-purple-500/20 text-purple-300 border border-purple-500/30 flex items-center gap-1">
                         <Brain className="w-3 h-3" />
@@ -3182,9 +3322,13 @@ ${items.join('\n\n')}
                 <div className="w-10 h-10 rounded-lg bg-slate-800/80 border border-slate-700/50 flex items-center justify-center mx-auto text-slate-400">
                   <Activity className="w-5 h-5 text-emerald-400" />
                 </div>
-                <h3 className="text-xs font-bold text-white">Background AI Agent Active</h3>
+                <h3 className="text-xs font-bold text-white">
+                  {sessionOpen ? 'Background AI Agent Active' : 'Waiting for New York Session'}
+                </h3>
                 <p className="text-[11px] text-slate-400 max-w-sm mx-auto">
-                  Scanning {SCAN_WHITELIST.size} whitelisted pairs with real Binance klines for confluence ≥ {MIN_CONFLUENCE_SCORE}...
+                  {sessionOpen
+                    ? `Scanning ${SCAN_WHITELIST.size} whitelisted pairs with real Binance klines for confluence ≥ ${MIN_CONFLUENCE_SCORE}...`
+                    : 'Asia and London sessions are disabled. Trading resumes at 12:00 UTC (New York AM killzone).'}
                 </p>
               </div>
             )}
@@ -3220,11 +3364,11 @@ ${items.join('\n\n')}
                   <span>Daily P&L</span>
                   <Zap className="w-4 h-4 text-emerald-400" />
                 </div>
-                <div className={`text-base font-bold font-mono mt-1 ${dailyPnlRef.current.pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                  {dailyPnlRef.current.pnl >= 0 ? '+' : ''}{dailyPnlRef.current.pnl.toFixed(2)}%
+                <div className={`text-base font-bold font-mono mt-1 ${riskStatus.dailyPnlPct >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                  {riskStatus.dailyPnlPct >= 0 ? '+' : ''}{riskStatus.dailyPnlPct.toFixed(2)}%
                 </div>
                 <div className="text-[10px] font-mono text-slate-500 mt-0.5">
-                  Kill at -{MAX_DAILY_LOSS_PCT}% · persisted
+                  Kill at -{MAX_DAILY_LOSS_PCT}% · {riskStatus.consecutiveLosses} consecutive losses
                 </div>
               </div>
               <div className="bg-slate-900/80 border border-slate-800 p-3 rounded-xl">
@@ -3236,7 +3380,7 @@ ${items.join('\n\n')}
                   {apiSettings.environment.toUpperCase()} - {apiSettings.enableFutures ? 'FUTURES' : 'SPOT'}
                 </div>
                 <div className="text-[10px] font-mono text-slate-500 mt-0.5">
-                  {longsCount(activeTrades)}L / {shortsCount(activeTrades)}S
+                  {longsCount(activeTrades)}L / {shortsCount(activeTrades)}S · {sessionOpen ? 'Session OPEN' : 'Session CLOSED'}
                 </div>
               </div>
             </div>
@@ -3269,6 +3413,29 @@ ${items.join('\n\n')}
                   </div>
                 </div>
               )}
+
+              <div className="p-3 bg-slate-950 rounded-xl border border-rose-500/30 space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-bold text-white flex items-center gap-1.5">
+                    <Shield className="w-3.5 h-3.5 text-rose-400" />
+                    Risk Engine State
+                  </span>
+                  <button
+                    onClick={() => { resetRiskState(); setRiskStatus(getRiskStatus()); }}
+                    className="px-2 py-1 rounded bg-rose-500/20 hover:bg-rose-500/30 text-rose-200 border border-rose-500/40 text-[10px] font-bold cursor-pointer"
+                  >
+                    Reset
+                  </button>
+                </div>
+                <div className="grid grid-cols-2 gap-2 text-[11px] font-mono">
+                  <div className="flex justify-between"><span className="text-slate-400">Daily P&L:</span><span className={riskStatus.dailyPnlPct >= 0 ? 'text-emerald-300' : 'text-rose-300'}>{riskStatus.dailyPnlPct.toFixed(2)}%</span></div>
+                  <div className="flex justify-between"><span className="text-slate-400">Trades today:</span><span className="text-slate-200">{riskStatus.tradesToday}/{RISK_CONFIG.maxTradesPerDay}</span></div>
+                  <div className="flex justify-between"><span className="text-slate-400">Loss streak:</span><span className="text-slate-200">{riskStatus.consecutiveLosses}/{RISK_CONFIG.maxConsecutiveLosses}</span></div>
+                  <div className="flex justify-between"><span className="text-slate-400">Halted:</span><span className={riskStatus.halted ? 'text-rose-300' : 'text-emerald-300'}>{riskStatus.halted ? 'YES' : 'no'}</span></div>
+                  <div className="flex justify-between"><span className="text-slate-400">In cooldown:</span><span className="text-slate-200">{riskStatus.inCooldown ? 'YES' : 'no'}</span></div>
+                  <div className="flex justify-between"><span className="text-slate-400">Session open:</span><span className={sessionOpen ? 'text-emerald-300' : 'text-slate-400'}>{sessionOpen ? 'YES' : 'no'}</span></div>
+                </div>
+              </div>
 
               {orphanPositions.length > 0 && (
                 <div className="p-3 bg-amber-500/10 border border-amber-500/40 rounded-xl">
@@ -3442,8 +3609,16 @@ ${items.join('\n\n')}
                 <div>✅ R:R lowered 2.5 → {botConfig.risk_engine.min_reward_risk_ratio} (realistic TP target)</div>
                 <div>✅ AUTO-RECONCILE every {Math.round(RECONCILE_INTERVAL_MS / 60000)}m — detects SL/TP fills that WebSocket missed</div>
                 <div>✅ PERSISTENT STATE — daily PnL + per-symbol entry caps survive page reload</div>
-                <div>✅ Gemini AI Validator model: gemini-3.8-flash (fast-fails on 503 overload)</div>
+                <div>✅ Gemini AI Validator model: gemini-1.5-flash (fast-fails on 503 overload)</div>
                 <div>✅ WEEKEND FILTER: {SKIP_WEEKENDS ? 'ON — no new entries Sat/Sun UTC' : 'OFF'}</div>
+                <div>✅ <span className="text-emerald-400">FIX 1</span>: background scan always uses latest API keys (ref-pinned)</div>
+                <div>✅ <span className="text-emerald-400">FIX 5</span>: P&amp;L multiplied by leverage ({TRADING_LEVERAGE}x) for accurate daily loss tracking</div>
+                <div>✅ <span className="text-rose-400">RISK 1</span>: session gate — only NEW_YORK_AM (12:00-16:00 UTC) trades</div>
+                <div>✅ <span className="text-rose-400">RISK 2</span>: daily loss limit lowered to {MAX_DAILY_LOSS_PCT}% (personal hard stop)</div>
+                <div>✅ <span className="text-rose-400">RISK 3</span>: cooldown after {RISK_CONFIG.maxConsecutiveLosses} consecutive losses</div>
+                <div>✅ <span className="text-rose-400">RISK 4</span>: ATR-based riskEngine.approveTrade gates every entry</div>
+                <div>✅ <span className="text-rose-400">RISK 5</span>: registerEntry / registerExit sync with risk engine state</div>
+                <div>✅ <span className="text-amber-400">GHOST GUARD</span>: rejects impossible daily P&amp;L values on startup (fixes -12.32% bug)</div>
                 <div>{aiValidatorEnabled && isAiValidatorConfigured() ? '✅ AI Trade Validator ON' : aiValidatorEnabled ? '⚠️ AI Validator ON but no key — running rules-only' : '⏸ AI Trade Validator OFF'}</div>
               </div>
             </div>

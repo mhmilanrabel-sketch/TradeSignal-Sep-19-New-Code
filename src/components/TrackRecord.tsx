@@ -1,4 +1,7 @@
 // src/components/TrackRecord.tsx
+// 🔧 CSV EXPORT ADDED (2026-10-10): Export all closed signals to CSV for analysis in Excel/Sheets.
+//    Everything else is unchanged from your original.
+
 import React, { useState, useMemo, useEffect } from 'react';
 import { ClosedSignal, PerformanceStats } from '../types';
 import {
@@ -21,7 +24,8 @@ import {
   Clock,
   Copy,
   Check,
-  X
+  X,
+  Download,   // 🔧 ADDED for CSV export
 } from 'lucide-react';
 
 const NOW = Date.now();
@@ -343,6 +347,92 @@ export const TrackRecord: React.FC = () => {
     setTimeout(() => setCopiedId(null), 2000);
   };
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // 🔧 CSV EXPORT — download all closed signals as a spreadsheet
+  // ═══════════════════════════════════════════════════════════════════════════
+  const handleExportCSV = () => {
+    if (signalsList.length === 0) {
+      setActionFeedback({
+        type: 'warning',
+        message: 'No closed signals to export.',
+      });
+      return;
+    }
+
+    // ── CSV columns ──
+    const headers = [
+      'ID',
+      'Symbol',
+      'Direction',
+      'Timeframe',
+      'Outcome',
+      'Entry Price',
+      'Stop Loss',
+      'Exit Price',
+      'PnL %',
+      'PnL Points',
+      'Start Time (UTC)',
+      'Closed At',
+      'Duration',
+      'Timestamp (epoch ms)',
+    ];
+
+    // ── Escape helper (handles quotes, commas, newlines) ──
+    const escape = (val: unknown): string => {
+      if (val === null || val === undefined) return '';
+      const s = String(val);
+      if (s.includes(',') || s.includes('"') || s.includes('\n') || s.includes('\r')) {
+        return `"${s.replace(/"/g, '""')}"`;
+      }
+      return s;
+    };
+
+    // ── Build rows ──
+    const rows = signalsList.map((s) => [
+      s.id,
+      s.symbol,
+      s.direction,
+      s.timeframe,
+      s.outcome || 'CLOSED',
+      s.entryPrice,
+      s.stopLoss ?? '',
+      s.exitPrice,
+      (s.pnlPercentage ?? 0).toFixed(2),
+      s.pnlPipsOrPoints ?? '',
+      s.timeStart ?? '',
+      s.closedAt ?? '',
+      s.duration ?? s.holdingTime ?? '',
+      s.timestamp ?? '',
+    ]);
+
+    // ── Compose CSV ──
+    const csvLines = [
+      headers.map(escape).join(','),
+      ...rows.map((r) => r.map(escape).join(',')),
+    ];
+    const csvContent = csvLines.join('\r\n');
+
+    // ── Download ──
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    const today = new Date().toISOString().slice(0, 10);
+    link.href = url;
+    link.setAttribute('download', `tradesignal_closed_journal_${today}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+
+    setActionFeedback({
+      type: 'success',
+      message: `Exported ${signalsList.length} record(s) to CSV.`,
+    });
+
+    // Auto-clear the success message after 4 seconds
+    setTimeout(() => setActionFeedback(null), 4000);
+  };
+
   // Archive records older than 5 days
   const handleArchiveOlderThan5Days = () => {
     const FIVE_DAYS_MS = 5 * 24 * 60 * 60 * 1000;
@@ -576,6 +666,19 @@ export const TrackRecord: React.FC = () => {
           </div>
 
           <div className="flex flex-wrap items-center gap-2 w-full xl:w-auto">
+            {/* 🔧 CSV EXPORT BUTTON — added 2026-10-10 */}
+            <button
+              id="journal-export-csv-btn"
+              type="button"
+              onClick={handleExportCSV}
+              disabled={signalsList.length === 0}
+              title="Download all closed signals as CSV (opens in Excel)"
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 text-xs font-mono font-bold transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              <Download className="w-3.5 h-3.5 text-emerald-400" />
+              <span>Export CSV</span>
+            </button>
+
             <button
               id="journal-archive-btn"
               type="button"
